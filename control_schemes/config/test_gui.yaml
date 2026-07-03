@@ -1,0 +1,29 @@
+gui_controls:
+  axes:
+    - name: "Lift"
+      min: -1.0
+      max: 1.0
+    - name: "Arm"
+      min: -1.0
+      max: 1.0
+    - name: "Wrist Yaw"
+      min: -1.0
+      max: 1.0
+    - name: "Wrist Pitch"
+      min: -1.0
+      max: 1.0
+    - name: "Wrist Roll"
+      min: -1.0
+      max: 1.0
+    - name: "Gripper"
+      min: -1.0
+      max: 1.0
+  buttons:
+    - name: "Forward"
+      toggle: false
+    - name: "Backward"
+      toggle: false
+    - name: "Left"
+      toggle: false
+    - name: "Right"
+      toggle: false

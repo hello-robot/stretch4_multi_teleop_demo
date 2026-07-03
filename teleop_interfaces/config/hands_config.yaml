@@ -1,0 +1,19 @@
+virtual_sensors:
+  - name: "left_pinch"
+    p1: "left_index_finger_tip"
+    p2: "left_thumb_tip"
+    type: "button"
+    threshold: 0.05
+
+  - name: "right_pinch"
+    p1: "right_index_finger_tip"
+    p2: "right_thumb_tip"
+    type: "button"
+    threshold: 0.05
+
+  - name: "hand_distance"
+    p1: "left_wrist"
+    p2: "right_wrist"
+    type: "axis"
+    min_dist: 0.1
+    max_dist: 0.5

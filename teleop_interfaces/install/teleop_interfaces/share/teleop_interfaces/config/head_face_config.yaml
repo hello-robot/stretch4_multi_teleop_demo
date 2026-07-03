@@ -1,0 +1,46 @@
+virtual_axes:
+  - name: "blink_left"
+    p1: "left_eye_top"
+    p2: "left_eye_bottom"
+    type: "button"
+    threshold: 0.009
+
+  - name: "blink_right"
+    p1: "right_eye_top"
+    p2: "right_eye_bottom"
+    type: "button"
+    threshold: 0.009
+
+  - name: "eye_x"
+    p1: "left_iris"
+    p2: "left_eye_inner"
+    type: "axis"
+    min_dist: 0.01
+    max_dist: 0.05
+
+  - name: "eye_y"
+    p1: "left_iris"
+    p2: "left_eye_top"
+    type: "axis"
+    min_dist: 0.01
+    max_dist: 0.05
+
+  - name: "mouth_close"
+    p1: "mouth_top"
+    p2: "mouth_bottom"
+    type: "button"
+    threshold: 0.03
+
+  - name: "mouth_width"
+    p1: "mouth_left"
+    p2: "mouth_right"
+    type: "axis"
+    min_dist: 0.05
+    max_dist: 0.1
+
+  - name: "eyebrow_raise"
+    p1: "left_eyebrow"
+    p2: "left_eye_top"
+    type: "axis"
+    min_dist: 0.03
+    max_dist: 0.05

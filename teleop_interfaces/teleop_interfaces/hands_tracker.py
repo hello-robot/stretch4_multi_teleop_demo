@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+import rclpy
+from teleop_interfaces.mediapipe_base import MediaPipeBaseNode
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+import numpy as np
+import cv2
+
+class HandsTracker(MediaPipeBaseNode):
+    def __init__(self, config_path):
+        hand_lms = [
+            'WRIST', 'THUMB_CMC', 'THUMB_MCP', 'THUMB_IP', 'THUMB_TIP',
+            'INDEX_FINGER_MCP', 'INDEX_FINGER_PIP', 'INDEX_FINGER_DIP', 'INDEX_FINGER_TIP',
+            'MIDDLE_FINGER_MCP', 'MIDDLE_FINGER_PIP', 'MIDDLE_FINGER_DIP', 'MIDDLE_FINGER_TIP',
+            'RING_FINGER_MCP', 'RING_FINGER_PIP', 'RING_FINGER_DIP', 'RING_FINGER_TIP',
+            'PINKY_MCP', 'PINKY_PIP', 'PINKY_DIP', 'PINKY_TIP'
+        ]
+        self._point_names = [f"left_{name.lower()}" for name in hand_lms] + \
+                            [f"right_{name.lower()}" for name in hand_lms]
+        super().__init__('hands_tracker', config_path)
+        
+        if not self.model_path:
+            return
+            
+        base_options = python.BaseOptions(model_asset_path=self.model_path)
+        options = vision.HandLandmarkerOptions(
+            base_options=base_options,
+            num_hands=2)
+        self.detector = vision.HandLandmarker.create_from_options(options)
+
+    def process_frame(self, frame):
+        if not hasattr(self, 'detector'):
+            return None
+            
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        
+        detection_result = self.detector.detect(mp_image)
+        
+        if not detection_result.hand_landmarks:
+            return None
+            
+        hand_found = {'left': False, 'right': False}
+
+        for i, hand_landmarks in enumerate(detection_result.hand_landmarks):
+            label = detection_result.handedness[i][0].category_name.lower() # 'left' or 'right'
+            hand_found[label] = True
+            for j, lm in enumerate(hand_landmarks):
+                # Using the hand_lms names we know
+                hand_lms = [
+                    'WRIST', 'THUMB_CMC', 'THUMB_MCP', 'THUMB_IP', 'THUMB_TIP',
+                    'INDEX_FINGER_MCP', 'INDEX_FINGER_PIP', 'INDEX_FINGER_DIP', 'INDEX_FINGER_TIP',
+                    'MIDDLE_FINGER_MCP', 'MIDDLE_FINGER_PIP', 'MIDDLE_FINGER_DIP', 'MIDDLE_FINGER_TIP',
+                    'RING_FINGER_MCP', 'RING_FINGER_PIP', 'RING_FINGER_DIP', 'RING_FINGER_TIP',
+                    'PINKY_MCP', 'PINKY_PIP', 'PINKY_DIP', 'PINKY_TIP'
+                ]
+                l_name = f"{label}_{hand_lms[j].lower()}"
+                self._landmarks[l_name] = [lm.x, lm.y, lm.z]
+
+        wrists = []
+        for side in ['left', 'right']:
+            name = f"{side}_wrist"
+            if hand_found[side] and name in self._landmarks:
+                wrists.append(self._landmarks[name])
+            
+        if not wrists:
+            return None
+            
+        center = np.mean(wrists, axis=0)
+        x, y, z = center
+        
+        roll, pitch, yaw = 0.0, 0.0, 0.0
+        if len(wrists) == 2:
+            dw = np.array(wrists[1]) - np.array(wrists[0])
+            yaw = np.arctan2(dw[1], dw[0])
+            
+        return [x, y, z, roll, pitch, yaw]
+
+def main(args=None):
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-c', '--config', help='Path to config file')
+    parsed_args, unknown = parser.parse_known_args()
+
+    rclpy.init(args=unknown)
+    node = None
+    try:
+        node = HandsTracker(parsed_args.config)
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()

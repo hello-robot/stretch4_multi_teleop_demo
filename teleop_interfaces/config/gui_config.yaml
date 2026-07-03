@@ -1,0 +1,33 @@
+gui_controls:
+  axes:
+    - name: "X"
+      min: -1.0
+      max: 1.0
+    - name: "Y"
+      min: -1.0
+      max: 1.0
+    - name: "Z"
+      min: -1.0
+      max: 1.0
+    - name: "Roll"
+      min: -1.0
+      max: 1.0
+    - name: "Pitch"
+      min: -1.0
+      max: 1.0
+    - name: "Yaw"
+      min: -1.0
+      max: 1.0
+  buttons:
+    - name: "Gripper"
+      toggle: true
+    - name: "Open"
+      toggle: false
+    - name: "Home"
+      toggle: false
+    - name: "Calibrate"
+      toggle: true
+    - name: "Record"
+      toggle: true
+    - name: "Stop"
+      toggle: false

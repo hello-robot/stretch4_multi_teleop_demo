@@ -1,0 +1,14 @@
+virtual_axes:
+  - name: "pinch_width"
+    p1: "index_finger_tip"
+    p2: "thumb_tip"
+    type: "axis"
+    min_dist: 0.02
+    max_dist: 0.2
+
+  - name: "thumb_pinky_dist"
+    p1: "thumb_tip"
+    p2: "pinky_tip"
+    type: "axis"
+    min_dist: 0.05
+    max_dist: 0.3

@@ -1,0 +1,6 @@
+#!/home/eshort/human_sandbox/ament_ws/src/stretch4_multi_teleop/teleop_interfaces/venv_voice/bin/python3
+import sys
+from httpx import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())
