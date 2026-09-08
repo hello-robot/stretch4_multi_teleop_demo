@@ -5,15 +5,22 @@ from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
-    # --- EDIT THESE PATHS AS NEEDED ---
-    default_model_dir = "/home/eshort/human_sandbox/headtracking_demo/model"
-    face_model = PathJoinSubstitution([default_model_dir, "face_landmarker.task"])
-    hand_model = PathJoinSubstitution([default_model_dir, "hand_landmarker.task"])
-    # ----------------------------------
+    # --- Models and Configs ---
+    model_dir_arg = DeclareLaunchArgument(
+        'model_dir',
+        default_value='models',
+        description='Directory containing Mediapipe task models'
+    )
+    
+    model_dir = LaunchConfiguration('model_dir')
+    face_model = PathJoinSubstitution([model_dir, "face_landmarker.task"])
+    hand_model = PathJoinSubstitution([model_dir, "hand_landmarker.task"])
+    # --------------------------
 
     pkg_share = FindPackageShare('teleop_interfaces')
 
     return LaunchDescription([
+        model_dir_arg,
         DeclareLaunchArgument('face_model_path', default_value=face_model),
         DeclareLaunchArgument('hand_model_path', default_value=hand_model),
         DeclareLaunchArgument('visualize', default_value='true'),
@@ -47,6 +54,9 @@ def generate_launch_description():
                 'visualize': LaunchConfiguration('visualize'),
                 'use_webcam': False,
                 'image_topic': LaunchConfiguration('image_topic'),
+                'workspace_zero': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                'workspace_min': [0.0, 0.0, -0.5, -0.4, -0.3, -0.5],
+                'workspace_max': [1.0, 1.0, 0.5, 0.4, 0.45, 0.5],
             }],
             arguments=['-c', PathJoinSubstitution([pkg_share, 'config', 'head_face_config.yaml'])]
         ),
@@ -61,6 +71,7 @@ def generate_launch_description():
                 'visualize': LaunchConfiguration('visualize'),
                 'use_webcam': False,
                 'image_topic': LaunchConfiguration('image_topic'),
+                'workspace_zero': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             }],
             arguments=['-c', PathJoinSubstitution([pkg_share, 'config', 'hands_config.yaml'])]
         ),
@@ -76,6 +87,7 @@ def generate_launch_description():
                 'hand_to_track': 'right',
                 'use_webcam': False,
                 'image_topic': LaunchConfiguration('image_topic'),
+                'workspace_zero': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             }],
             arguments=['-c', PathJoinSubstitution([pkg_share, 'config', 'hand_config.yaml'])]
         ),

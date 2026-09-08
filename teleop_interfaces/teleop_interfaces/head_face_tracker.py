@@ -68,7 +68,9 @@ class HeadFaceTracker(MediaPipeBaseNode):
         
         top = face_landmarks[10]
         chin = face_landmarks[152]
-        pitch = (nose.y - (top.y + chin.y)/2.0) / (chin.y - top.y + 1e-6)
+        dy = chin.y - top.y
+        dz = top.z - chin.z
+        pitch = np.arctan2(dz, dy)
         
         return [x, y, z, roll, pitch, yaw]
 

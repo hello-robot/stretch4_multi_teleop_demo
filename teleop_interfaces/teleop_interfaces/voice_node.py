@@ -1,4 +1,4 @@
-#!/home/eshort/human_sandbox/ament_ws/src/stretch4_multi_teleop/teleop_interfaces/venv_voice/bin/python3
+#!/usr/bin/env python3
 import sys
 import os
 import threading
@@ -8,10 +8,6 @@ import numpy as np
 import io
 import re
 from pynput import keyboard
-
-# Add ROS and Workspace paths for inheritance
-sys.path.append("/opt/ros/jazzy/lib/python3.12/site-packages")
-sys.path.append("/home/eshort/human_sandbox/ament_ws/install/multi_teleop/lib/python3.12/site-packages")
 
 import rclpy
 from multi_teleop.base import InputInterfaceNode

@@ -12,8 +12,8 @@ def generate_launch_description():
     return LaunchDescription([
         Node(
             package='control_schemes',
-            executable='position_control_node',
-            name='position_control_node',
+            executable='direct_position_control',
+            name='direct_position_control',
             output='screen'
         ),
         Node(
@@ -23,7 +23,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{'config_file': gui_config}],
             remappings=[
-                ('gui_node/output', 'position_control/input')
+                ('gui_node/output', 'direct_position_control/input')
             ]
         )
     ])

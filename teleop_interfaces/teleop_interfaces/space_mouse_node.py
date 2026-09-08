@@ -5,7 +5,7 @@ import pyspacemouse
 
 class SpaceMouseNode(InputInterfaceNode):
     def __init__(self):
-        axis_names = ['x', 'y', 'z', 'r', 'p', 'y']
+        axis_names = ['x', 'y', 'z', 'roll', 'pitch', 'yaw']
         button_names = ['button-1', 'button-2']
         super().__init__('space_mouse', axis_names, button_names)
         

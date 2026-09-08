@@ -2,6 +2,8 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 
 def generate_launch_description():
     teleop_interfaces_dir = get_package_share_directory('teleop_interfaces')
@@ -9,11 +11,17 @@ def generate_launch_description():
     hand_config = os.path.join(teleop_interfaces_dir, 'config', 'hand_config.yaml')
     
     return LaunchDescription([
-        # Position Control Node (Simulator + ROS Interface)
+        DeclareLaunchArgument(
+            'model_path',
+            default_value='path/to/hand_landmarker.task',
+            description='Path to the Mediapipe hand landmarker model'
+        ),
+
+        # Direct Position Control Node (Simulator + ROS Interface)
         Node(
             package='control_schemes',
-            executable='position_control_node',
-            name='position_control_node',
+            executable='direct_position_control',
+            name='direct_position_control',
             output='screen'
         ),
         
@@ -32,7 +40,7 @@ def generate_launch_description():
             name='hand_tracker',
             output='screen',
             parameters=[{
-                'model_path': '/home/eshort/human_sandbox/headtracking_demo/model/hand_landmarker.task',
+                'model_path': LaunchConfiguration('model_path'),
                 'hand_to_track': 'right'
             }],
             arguments=['-c', hand_config]

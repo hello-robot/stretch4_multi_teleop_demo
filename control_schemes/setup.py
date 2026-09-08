@@ -28,7 +28,14 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'position_control_node = control_schemes.position_control_node:main'
+            'direct_position_control = control_schemes.direct_position_control:main',
+            'stretch_position_control = control_schemes.stretch_control_node:main_position',
+            'stretch_velocity_control = control_schemes.stretch_control_node:main_velocity',
+            'stretch_mixed_control = control_schemes.stretch_control_node:main_mixed',
+            'stretch_control_node = control_schemes.stretch_control_node:main',
+            'stretch_kinematic_control = control_schemes.stretch_kinematic_control:main',
+            'stretch_single_switch_control = control_schemes.stretch_single_switch_control:main',
+            'stretch_combined_control = control_schemes.stretch_combined_control_node:main',
         ],
     },
 )

@@ -1,7 +1,74 @@
+# Replaced cv_bridge with a pure Python/NumPy implementation to support NumPy 2.x
 import rclpy
 from multi_teleop.base import InputInterfaceNode
 from sensor_msgs.msg import Image, Joy
-from cv_bridge import CvBridge
+
+class CvBridge:
+    def imgmsg_to_cv2(self, msg, desired_encoding="bgr8"):
+        if desired_encoding != "bgr8":
+            raise NotImplementedError(f"Encoding '{desired_encoding}' is not supported.")
+        
+        # Map ROS encoding to numpy parameters
+        if msg.encoding == 'rgb8':
+            channels = 3
+            dtype = np.uint8
+        elif msg.encoding == 'bgr8':
+            channels = 3
+            dtype = np.uint8
+        elif msg.encoding == 'rgba8':
+            channels = 4
+            dtype = np.uint8
+        elif msg.encoding == 'bgra8':
+            channels = 4
+            dtype = np.uint8
+        elif msg.encoding == 'mono8':
+            channels = 1
+            dtype = np.uint8
+        elif msg.encoding in ('mono16', '16UC1'):
+            channels = 1
+            dtype = np.uint16
+        else:
+            raise ValueError(f"Unsupported image encoding: {msg.encoding}")
+
+        # Convert the raw buffer to a numpy array
+        try:
+            arr = np.frombuffer(msg.data, dtype=dtype)
+        except (TypeError, ValueError):
+            arr = np.asarray(msg.data, dtype=dtype)
+
+        # Reshape considering potential padding / step sizes
+        itemsize = np.dtype(dtype).itemsize
+        expected_step = msg.width * channels * itemsize
+        
+        if msg.step > expected_step:
+            shape = (msg.height, msg.width, channels) if channels > 1 else (msg.height, msg.width)
+            strides = (msg.step, channels * itemsize, itemsize) if channels > 1 else (msg.step, itemsize)
+            arr = np.lib.stride_tricks.as_strided(arr, shape=shape, strides=strides)
+        else:
+            expected_size = msg.height * msg.width * channels
+            arr = arr[:expected_size]
+            if channels > 1:
+                arr = arr.reshape((msg.height, msg.width, channels))
+            else:
+                arr = arr.reshape((msg.height, msg.width))
+
+        # Convert to BGR format for OpenCV / MediaPipe
+        if msg.encoding == 'rgb8':
+            return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        elif msg.encoding == 'bgr8':
+            return arr.copy()
+        elif msg.encoding == 'mono8':
+            return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+        elif msg.encoding == 'rgba8':
+            return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+        elif msg.encoding == 'bgra8':
+            return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+        elif msg.encoding in ('mono16', '16UC1'):
+            arr_8bit = (arr / 256).astype(np.uint8)
+            return cv2.cvtColor(arr_8bit, cv2.COLOR_GRAY2BGR)
+        else:
+            raise ValueError(f"Cannot convert encoding {msg.encoding} to bgr8")
+
 import mediapipe as mp
 import cv2
 import numpy as np
@@ -31,8 +98,11 @@ class MediaPipeBaseNode(InputInterfaceNode):
         self.declare_parameter('use_webcam', True)
         self.declare_parameter('webcam_id', 0)
         self.declare_parameter('image_topic', '/image_raw')
-        self.declare_parameter('workspace_center', [0.5, 0.5, 0.0])
+        self.declare_parameter('workspace_zero', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        self.declare_parameter('workspace_center', [0.5, 0.5, 0.0, 0.0, 0.0, 0.0])
         self.declare_parameter('workspace_dims', [1.0, 1.0, 1.0])
+        self.declare_parameter('workspace_min', [0.0, 0.0, -0.5, -1.0, -1.0, -1.0])
+        self.declare_parameter('workspace_max', [1.0, 1.0, 0.5, 1.0, 1.0, 1.0])
         self.declare_parameter('model_path', '') # Required
         self.declare_parameter('visualize', True)
         
@@ -177,18 +247,46 @@ class MediaPipeBaseNode(InputInterfaceNode):
                 cv2.waitKey(1)
             return
             
-        # Normalize 6DOF position
-        center = self.get_parameter('workspace_center').value
+        # Fetch 6DOF parameters
+        zero = self.get_parameter('workspace_zero').value
         dims = self.get_parameter('workspace_dims').value
+        ws_min = self.get_parameter('workspace_min').value
+        ws_max = self.get_parameter('workspace_max').value
         
-        norm_pos = []
-        for i in range(3):
-            val = (state_6dof[i] - center[i]) / (dims[i] / 2.0)
-            norm_pos.append(max(-1.0, min(1.0, val)))
+        # Resolve zero to 6DOF
+        if len(zero) == 3:
+            zero = list(zero) + [0.0, 0.0, 0.0]
             
-        # Orientation is usually already normalized or relative? 
-        # We'll just pass RPY as is or clamp if needed.
-        axes_values = norm_pos + state_6dof[3:]
+        # Resolve ws_min/ws_max to 6DOF
+        if len(ws_min) == 3:
+            ws_min = list(ws_min) + [-1.0, -1.0, -1.0]
+        if len(ws_max) == 3:
+            ws_max = list(ws_max) + [1.0, 1.0, 1.0]
+            
+        # Backwards compatibility with workspace_dims
+        if dims != [1.0, 1.0, 1.0]:
+            for i in range(3):
+                ws_min[i] = zero[i] - dims[i] / 2.0
+                ws_max[i] = zero[i] + dims[i] / 2.0
+
+        # Normalize 6DOF asymmetric position & orientation
+        axes_values = []
+        for i in range(6):
+            val = state_6dof[i]
+            z_val = zero[i]
+            min_val = ws_min[i]
+            max_val = ws_max[i]
+            
+            if val < z_val:
+                denom = z_val - min_val
+                if abs(denom) < 1e-6: denom = 1e-6
+                n_val = (val - z_val) / denom
+            else:
+                denom = max_val - z_val
+                if abs(denom) < 1e-6: denom = 1e-6
+                n_val = (val - z_val) / denom
+                
+            axes_values.append(max(-1.0, min(1.0, n_val)))
         button_values = []
         
         # Process virtual items
@@ -232,9 +330,9 @@ class MediaPipeBaseNode(InputInterfaceNode):
 
         # Visualization
         if self.get_parameter('visualize').value:
-            self._draw_visualization(frame, state_6dof, center, dims, v_viz_data)
+            self._draw_visualization(frame, state_6dof, zero, ws_min, ws_max, v_viz_data)
 
-    def _draw_visualization(self, frame, state, center, dims, v_viz_data):
+    def _draw_visualization(self, frame, state, zero, ws_min, ws_max, v_viz_data):
         h, w, _ = frame.shape
         
         # Viridis-inspired Palette (BGR)
@@ -244,15 +342,51 @@ class MediaPipeBaseNode(InputInterfaceNode):
         V_YELLOW = (37, 231, 253)
         
         # 1. Draw Workspace
-        x_min = int((center[0] - dims[0]/2) * w)
-        y_min = int((center[1] - dims[1]/2) * h)
-        x_max = int((center[0] + dims[0]/2) * w)
-        y_max = int((center[1] + dims[1]/2) * h)
+        x_min = int(ws_min[0] * w)
+        y_min = int(ws_min[1] * h)
+        x_max = int(ws_max[0] * w)
+        y_max = int(ws_max[1] * h)
         cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), V_BLUE, 2)
         cv2.putText(frame, "WORKSPACE", (x_min, y_min-10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, V_BLUE, 1)
         
         # 1.5 Draw FPS
         cv2.putText(frame, f"FPS: {self._fps:.1f}", (w - 100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, V_YELLOW, 2)
+        
+        # 1.6 Draw 6DOF Pose Panel
+        overlay = frame.copy()
+        panel_w = 200
+        panel_h = 145
+        cv2.rectangle(overlay, (10, 10), (10 + panel_w, 10 + panel_h), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+        cv2.rectangle(frame, (10, 10), (10 + panel_w, 10 + panel_h), V_BLUE, 1)
+        
+        # Calculate asymmetric 6DOF normalized position & orientation using zero
+        norm_vals = []
+        for i in range(6):
+            val = state[i]
+            z_val = zero[i]
+            min_val = ws_min[i]
+            max_val = ws_max[i]
+            
+            if val < z_val:
+                denom = z_val - min_val
+                if abs(denom) < 1e-6: denom = 1e-6
+                n_val = (val - z_val) / denom
+            else:
+                denom = max_val - z_val
+                if abs(denom) < 1e-6: denom = 1e-6
+                n_val = (val - z_val) / denom
+                
+            norm_vals.append(max(-1.0, min(1.0, n_val)))
+        
+        cv2.putText(frame, "6DOF POSE", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.45, V_YELLOW, 1, cv2.LINE_AA)
+        color_lbl = (200, 200, 200)
+        cv2.putText(frame, f"X:     {norm_vals[0]:.2f} ({state[0]:.3f})", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color_lbl, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"Y:     {norm_vals[1]:.2f} ({state[1]:.3f})", (20, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color_lbl, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"Z:     {norm_vals[2]:.2f} ({state[2]:.3f})", (20, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color_lbl, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"Roll:  {norm_vals[3]:.2f} ({state[3]:.3f})", (20, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color_lbl, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"Pitch: {norm_vals[4]:.2f} ({state[4]:.3f})", (20, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color_lbl, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"Yaw:   {norm_vals[5]:.2f} ({state[5]:.3f})", (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color_lbl, 1, cv2.LINE_AA)
         
         # 2. Draw Target
         px = int(state[0] * w)

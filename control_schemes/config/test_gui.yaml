@@ -27,3 +27,7 @@ gui_controls:
       toggle: false
     - name: "Right"
       toggle: false
+    - name: "rotate_cw"
+      toggle: false
+    - name: "rotate_ccw"
+      toggle: false

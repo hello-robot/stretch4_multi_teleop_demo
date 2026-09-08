@@ -11,16 +11,16 @@ import numpy as np
 import threading
 import time
 
-class PositionControlNode(ControlSchemeNode):
+class DirectPositionControlNode(ControlSchemeNode):
     def __init__(self):
         # Head Pan and Head Tilt are not available in this Stretch 4 MJCF model
         self.axis_names = [
             "Lift", "Arm", "Wrist Yaw", "Wrist Pitch", "Wrist Roll", "Gripper"
         ]
         self.button_names = [
-            "Forward", "Backward", "Left", "Right"
+            "Forward", "Backward", "Left", "Right", "rotate_cw", "rotate_ccw"
         ]
-        super().__init__("position_control", self.axis_names, self.button_names)
+        super().__init__("direct_position_control", self.axis_names, self.button_names)
         
         # Joint ranges
         self.ranges = {
@@ -41,8 +41,10 @@ class PositionControlNode(ControlSchemeNode):
         self.target_positions = {}
         self.target_v_x = 0.0
         self.target_v_y = 0.0
+        self.target_omega = 0.0
         self.last_sent_v_x = 0.0
         self.last_sent_v_y = 0.0
+        self.last_sent_omega = 0.0
         self.last_joy_time = 0.0
         self.prev_buttons = [0] * len(self.button_names)
         
@@ -52,7 +54,7 @@ class PositionControlNode(ControlSchemeNode):
         # Timer for commanding the robot at a fixed rate (20Hz)
         self.cmd_timer = self.create_timer(0.05, self.command_loop)
         
-        self.get_logger().info("Position Control Node Initialized with 20Hz command loop.")
+        self.get_logger().info("Direct Position Control Node Initialized with 20Hz command loop.")
 
     def handle_joy(self, axes: list, buttons: list):
         # Safety check for message size
@@ -66,6 +68,7 @@ class PositionControlNode(ControlSchemeNode):
 
         self.last_joy_time = time.time()
         vel_scale = 1.0 # m/s (increased from 0.5)
+        omega_scale = 1.5 # rad/s
         
         # Handle non-wheel joints (axes)
         for i, val in enumerate(axes):
@@ -77,7 +80,7 @@ class PositionControlNode(ControlSchemeNode):
                 self.target_positions[actuator_name] = pos
                 
         # Handle directional movement (buttons)
-        # buttons: 0:Forward, 1:Backward, 2:Left, 3:Right
+        # buttons: 0:Forward, 1:Backward, 2:Left, 3:Right, 4:rotate_cw, 5:rotate_ccw
         
         # Check for new presses to prioritize newest direction
         # X Axis (Forward/Backward)
@@ -108,6 +111,19 @@ class PositionControlNode(ControlSchemeNode):
             if buttons[2]: self.target_v_y = vel_scale
             elif buttons[3]: self.target_v_y = -vel_scale
 
+        # Rotation (CW/CCW)
+        if buttons[5] and not self.prev_buttons[5]:
+            self.target_omega = omega_scale
+        elif buttons[4] and not self.prev_buttons[4]:
+            self.target_omega = -omega_scale
+        elif self.target_omega > 0 and not buttons[5]:
+            self.target_omega = -omega_scale if buttons[4] else 0.0
+        elif self.target_omega < 0 and not buttons[4]:
+            self.target_omega = omega_scale if buttons[5] else 0.0
+        elif self.target_omega == 0:
+            if buttons[5]: self.target_omega = omega_scale
+            elif buttons[4]: self.target_omega = -omega_scale
+
         self.prev_buttons = list(buttons)
 
     def command_loop(self):
@@ -118,6 +134,7 @@ class PositionControlNode(ControlSchemeNode):
         if time.time() - self.last_joy_time > 0.5:
             self.target_v_x = 0.0
             self.target_v_y = 0.0
+            self.target_omega = 0.0
 
         # Send joint commands
         for actuator_name, pos in self.target_positions.items():
@@ -128,14 +145,20 @@ class PositionControlNode(ControlSchemeNode):
                 self.sim.move_to(actuator_name, pos)
         
         # Only send base velocity command if it has changed
-        if self.target_v_x != self.last_sent_v_x or self.target_v_y != self.last_sent_v_y:
-            self.sim.set_base_velocity(self.target_v_x, self.target_v_y, 0.0)
+        if (self.target_v_x != self.last_sent_v_x or 
+            self.target_v_y != self.last_sent_v_y or 
+            self.target_omega != self.last_sent_omega):
+            if isinstance(self.sim, Stretch4MujocoSimulator):
+                self.sim.set_base_velocity(v_x=self.target_v_x, v_y=self.target_v_y, omega=self.target_omega)
+            else:
+                self.sim.set_base_velocity(self.target_v_y, self.target_omega)
             self.last_sent_v_x = self.target_v_x
             self.last_sent_v_y = self.target_v_y
+            self.last_sent_omega = self.target_omega
 
 def main(args=None):
     rclpy.init(args=args)
-    node = PositionControlNode()
+    node = DirectPositionControlNode()
     
     # Start ROS spin in a separate thread
     ros_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)

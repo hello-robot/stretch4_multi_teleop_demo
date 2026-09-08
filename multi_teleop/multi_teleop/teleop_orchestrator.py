@@ -172,6 +172,9 @@ class AxisButtonControl(Construction):
 class OrchestratorNode(Node):
     def __init__(self):
         super().__init__('teleop_orchestrator')
+        self.get_logger().info("=============================================")
+        self.get_logger().info("Teleop Orchestrator Version 2.0 (Multi-Mapping, Sensitivity, Invert) Initialized!")
+        self.get_logger().info("=============================================")
         self.inputs = {} # topic -> {axis_names, button_names, last_msg, node_name}
         self.constructions = {} # name -> Construction object
         self.mapping = {'axes': {}, 'buttons': {}} # output_name -> input_source_name
@@ -196,6 +199,40 @@ class OrchestratorNode(Node):
         self.create_timer(1.0/30.0, self.process_and_publish)
         
         self.signal_pool = {}
+        
+        # Multi-mapping data structures
+        self.scheme_mappings = {} # scheme_name -> list of mapping dicts
+        self.scheme_cycle_buttons = {} # scheme_name -> cycle_button_signal_name
+        self.scheme_active_indices = {} # scheme_name -> active_mapping_index
+        self.prev_cycle_button_states = {} # scheme_name -> last_button_value
+        self.app = None # Reference to OrchestratorUI
+
+    def get_mappings_for_scheme(self, scheme_name):
+        if scheme_name not in self.scheme_mappings:
+            self.scheme_mappings[scheme_name] = [{
+                'axes': {},
+                'buttons': {},
+                'sensitivities': {},
+                'inverted': {}
+            }]
+        return self.scheme_mappings[scheme_name]
+
+    def get_active_mapping_index_for_scheme(self, scheme_name):
+        if scheme_name not in self.scheme_active_indices:
+            self.scheme_active_indices[scheme_name] = 0
+        return self.scheme_active_indices[scheme_name]
+
+    def get_active_mapping(self, scheme_name):
+        mappings = self.get_mappings_for_scheme(scheme_name)
+        idx = self.get_active_mapping_index_for_scheme(scheme_name)
+        if idx >= len(mappings):
+            idx = 0
+            self.scheme_active_indices[scheme_name] = 0
+        return mappings[idx]
+
+    def trigger_ui_cycle_update(self):
+        if hasattr(self, 'app') and self.app and self.app.mapping_win:
+            GLib.idle_add(self.app.mapping_win.on_mapping_cycled_externally)
         
     def discover_environment(self):
         # 1. Discover Joy Topics
@@ -321,6 +358,13 @@ class OrchestratorNode(Node):
                         if scheme_data['axis_names'] or scheme_data['button_names']:
                             scheme_data['topic'] = topic
                             self.control_schemes[node_name] = scheme_data
+                            
+                            if node_name == self.selected_scheme:
+                                self.get_logger().info(f"Activating discovered selected scheme: {node_name}")
+                                threading.Thread(target=self.call_scheme_service, args=(node_name, 'activate'), daemon=True).start()
+                            else:
+                                self.get_logger().info(f"Deactivating discovered non-selected scheme: {node_name}")
+                                threading.Thread(target=self.call_scheme_service, args=(node_name, 'deactivate'), daemon=True).start()
         except Exception as e:
             self.get_logger().error(f"Error checking control scheme {node_name}: {e}")
         finally:
@@ -358,16 +402,61 @@ class OrchestratorNode(Node):
         if not self.selected_scheme or self.selected_scheme not in self.control_schemes:
             return
             
+        # Check cycle button first
+        cycle_btn = self.scheme_cycle_buttons.get(self.selected_scheme)
+        if cycle_btn:
+            val = self.signal_pool.get(cycle_btn, 0)
+            prev_val = self.prev_cycle_button_states.get(self.selected_scheme, 0)
+            if val == 1 and prev_val == 0:
+                # Rising edge detected! Cycle active mapping index
+                mappings = self.get_mappings_for_scheme(self.selected_scheme)
+                if len(mappings) > 1:
+                    curr_idx = self.get_active_mapping_index_for_scheme(self.selected_scheme)
+                    next_idx = (curr_idx + 1) % len(mappings)
+                    self.scheme_active_indices[self.selected_scheme] = next_idx
+                    self.trigger_ui_cycle_update()
+            self.prev_cycle_button_states[self.selected_scheme] = val
+
         scheme = self.control_schemes[self.selected_scheme]
+        active_mapping = self.get_active_mapping(self.selected_scheme)
         out_msg = Joy()
         out_msg.header.stamp = self.get_clock().now().to_msg()
         
         for name in scheme['axis_names']:
-            source = self.mapping['axes'].get(name)
-            out_msg.axes.append(self.signal_pool.get(source, 0.0) if source else 0.0)
+            source = active_mapping['axes'].get(name)
+            if source:
+                raw_val = self.signal_pool.get(source, 0.0)
+                # Apply deadband if configured
+                db_pct = active_mapping.get('deadbands', {}).get(name, 0)
+                d = db_pct / 100.0
+                if abs(raw_val) <= d:
+                    raw_val = 0.0
+                else:
+                    if d < 1.0:
+                        raw_val = math.copysign((abs(raw_val) - d) / (1.0 - d), raw_val)
+                    else:
+                        raw_val = 0.0
+
+                # Apply sensitivity/response curve
+                sens = active_mapping.get('sensitivities', {}).get(name, 50)
+                if sens <= 50:
+                    exponent = 1.0 + (50.0 - sens) / 25.0
+                    multiplier = sens / 50.0
+                else:
+                    exponent = 1.0 - (sens - 50.0) / 100.0
+                    multiplier = 1.0 + (sens - 50.0) / 50.0
+                out_val = math.copysign(abs(raw_val) ** exponent, raw_val) * multiplier
+                out_val = max(-1.0, min(1.0, out_val))
+                
+                # Apply inversion if checked
+                if active_mapping.get('inverted', {}).get(name, False):
+                    out_val = -out_val
+            else:
+                out_val = 0.0
+            out_msg.axes.append(out_val)
             
         for name in scheme['button_names']:
-            source = self.mapping['buttons'].get(name)
+            source = active_mapping['buttons'].get(name)
             out_msg.buttons.append(int(self.signal_pool.get(source, 0)) if source else 0)
             
         if self.output_publisher:
@@ -407,6 +496,13 @@ class OrchestratorNode(Node):
 
     def select_scheme(self, scheme_name):
         if scheme_name == self.selected_scheme: return
+        
+        # Deactivate previous scheme if any
+        prev_scheme = self.selected_scheme
+        if prev_scheme:
+            self.get_logger().info(f"Deactivating previous scheme: {prev_scheme}")
+            threading.Thread(target=self.call_scheme_service, args=(prev_scheme, 'deactivate'), daemon=True).start()
+            
         self.selected_scheme = scheme_name
         if self.output_publisher:
             self.destroy_publisher(self.output_publisher)
@@ -417,6 +513,31 @@ class OrchestratorNode(Node):
         topic = scheme['topic']
         self.output_publisher = self.create_publisher(Joy, topic, 1)
         self.get_logger().info(f"Selected control scheme: {scheme_name}, publishing to {topic}")
+        
+        # Activate newly selected scheme
+        self.get_logger().info(f"Activating new scheme: {scheme_name}")
+        threading.Thread(target=self.call_scheme_service, args=(scheme_name, 'activate'), daemon=True).start()
+
+    def call_scheme_service(self, scheme_name, action):
+        from std_srvs.srv import Trigger
+        srv_name = f"{scheme_name}/{action}"
+        try:
+            client = self.create_client(Trigger, srv_name)
+            if not client.wait_for_service(timeout_sec=2.0):
+                self.get_logger().warn(f"Service {srv_name} not available.")
+                return
+            req = Trigger.Request()
+            future = client.call_async(req)
+            while rclpy.ok() and not future.done():
+                time.sleep(0.05)
+            if future.done():
+                res = future.result()
+                if res.success:
+                    self.get_logger().info(f"Successfully called {srv_name}: {res.message}")
+                else:
+                    self.get_logger().error(f"Failed calling {srv_name}: {res.message}")
+        except Exception as e:
+            self.get_logger().error(f"Error calling service {srv_name}: {e}")
 
 # --- UI Classes ---
 
@@ -425,6 +546,7 @@ class OrchestratorUI(Adw.Application):
         super().__init__(application_id='com.antigravity.teleop_orchestrator',
                          flags=Gio.ApplicationFlags.FLAGS_NONE)
         self.node = node
+        self.node.app = self
         self.monitor_win = None
         self.mapping_win = None
         self.const_mgmt_win = None
@@ -473,17 +595,12 @@ class OrchestratorUI(Adw.Application):
             self.monitor_win.refresh_data()
 
     def do_activate(self):
-        # 1. Create Monitor Window (Raw + Constructed)
-        self.monitor_win = MonitorWindow(self, self.node)
-        self.monitor_win.present()
+        self.monitor_win = None
+        self.const_mgmt_win = None
         
-        # 2. Create Mapping Window (Scheme + Mapping + Save/Load)
+        # Create Mapping Window (Scheme + Mapping + Save/Load)
         self.mapping_win = MappingWindow(self, self.node)
         self.mapping_win.present()
-        
-        # 3. Create Construction Management Window (Add/Edit/Delete)
-        self.const_mgmt_win = ConstructionManagementWindow(self, self.node)
-        self.const_mgmt_win.present()
 
 class MonitorWindow(Gtk.Window):
     def __init__(self, app, node):
@@ -491,6 +608,7 @@ class MonitorWindow(Gtk.Window):
         self.node = node
         self.set_title("Orchestrator Monitor")
         self.set_default_size(400, 600)
+        self.connect("close-request", self.on_close_request)
         
         self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.main_box.set_margin_top(10)
@@ -509,6 +627,10 @@ class MonitorWindow(Gtk.Window):
         self.topic_widgets = {} # name -> {axes: [], buttons: []}
         
         GLib.timeout_add(100, self.refresh_data)
+        
+    def on_close_request(self, window):
+        self.get_application().monitor_win = None
+        return False
         
     def refresh_data(self):
         # 1. Update/Add topics
@@ -693,6 +815,7 @@ class ConstructionManagementWindow(Gtk.Window):
         self.node = node
         self.set_title("Signal Construction")
         self.set_default_size(400, 500)
+        self.connect("close-request", self.on_close_request)
         
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_margin_top(10); box.set_margin_bottom(10); box.set_margin_start(10); box.set_margin_end(10)
@@ -712,6 +835,10 @@ class ConstructionManagementWindow(Gtk.Window):
         box.append(add_btn)
         
         self.refresh_list()
+        
+    def on_close_request(self, window):
+        self.get_application().const_mgmt_win = None
+        return False
         
     def refresh_list(self):
         for child in list(self.const_list): self.const_list.remove(child)
@@ -758,10 +885,14 @@ class MappingWindow(Gtk.Window):
         self.node = node
         self.app = app
         self.set_title("Orchestrator Mapping")
-        self.set_default_size(800, 600)
+        self.set_default_size(1150, 650) # Extra width and height to comfortably display sliders/checkboxes
+        self.connect("close-request", self.on_close_request)
         
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        main_box.set_margin_top(20); main_box.set_margin_bottom(20); main_box.set_margin_start(20); main_box.set_margin_end(20)
+        main_box.set_margin_top(20)
+        main_box.set_margin_bottom(20)
+        main_box.set_margin_start(20)
+        main_box.set_margin_end(20)
         self.set_child(main_box)
         
         # Persistence (Top)
@@ -780,32 +911,37 @@ class MappingWindow(Gtk.Window):
         options_btn.connect('clicked', self.on_options_clicked)
         top_bar.append(options_btn)
         
-        # Scheme Selection
+        monitor_btn = Gtk.Button(label="Monitor")
+        monitor_btn.connect('clicked', self.on_monitor_clicked)
+        top_bar.append(monitor_btn)
+        
+        const_btn = Gtk.Button(label="Signal Construction")
+        const_btn.connect('clicked', self.on_const_clicked)
+        top_bar.append(const_btn)
+        
+        # Scheme Selection & Cycle Button Configuration
         scheme_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         scheme_box.append(Gtk.Label(label="Target Control Scheme:"))
         self.scheme_combo = Gtk.DropDown()
         scheme_box.append(self.scheme_combo)
+        
+        scheme_box.append(Gtk.Label(label="Cycle Button:"))
+        self.cycle_combo = Gtk.DropDown()
+        scheme_box.append(self.cycle_combo)
+        
         main_box.append(scheme_box)
+        
         self.scheme_combo.connect("notify::selected-item", self.on_scheme_selected)
+        self.cycle_combo.connect("notify::selected-item", self.on_cycle_button_selected)
         
-        # Mapping Columns
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_vexpand(True)
-        main_box.append(scrolled)
+        # Notebook for mapping tabs
+        self.mapping_notebook = Gtk.Notebook()
+        self.mapping_notebook.set_vexpand(True)
+        main_box.append(self.mapping_notebook)
         
-        cols_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
-        scrolled.set_child(cols_box)
+        # Connect switch-page and keep the handler ID
+        self.tab_switch_handler_id = self.mapping_notebook.connect("switch-page", self.on_tab_switched)
         
-        self.axis_mapping_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        self.axis_mapping_box.append(Gtk.Label(label="Axis Mapping", xalign=0))
-        cols_box.append(self.axis_mapping_box)
-        self.axis_mapping_box.set_hexpand(True)
-        
-        self.btn_mapping_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        self.btn_mapping_box.append(Gtk.Label(label="Button Mapping", xalign=0))
-        cols_box.append(self.btn_mapping_box)
-        self.btn_mapping_box.set_hexpand(True)
-
         self.last_schemes = []
         self.current_scheme_name = None
         self.last_axes = []
@@ -825,7 +961,8 @@ class MappingWindow(Gtk.Window):
             self.last_axes = all_axes
             self.last_btns = all_btns
             if self.current_scheme_name:
-                self.update_mapping_ui(self.current_scheme_name)
+                self.update_cycle_button_dropdown()
+                GLib.idle_add(self.rebuild_notebook_deferred)
         return True
 
     def on_scheme_selected(self, drop, param):
@@ -836,60 +973,278 @@ class MappingWindow(Gtk.Window):
         
         self.current_scheme_name = name
         self.node.select_scheme(name)
-        self.update_mapping_ui(name)
+        self.update_cycle_button_dropdown()
+        GLib.idle_add(self.rebuild_notebook_deferred)
+
+    def update_cycle_button_dropdown(self):
+        if not self.current_scheme_name: return
+        # Disconnect signal temporarily
+        try:
+            self.cycle_combo.disconnect_by_func(self.on_cycle_button_selected)
+        except:
+            pass
+            
+        all_btns = self.get_all_available_signals('button')
+        self.cycle_combo.set_model(Gtk.StringList.new(all_btns))
         
-    def update_mapping_ui(self, scheme_name):
-        scheme = self.node.control_schemes[scheme_name]
+        current = self.node.scheme_cycle_buttons.get(self.current_scheme_name)
+        if current in all_btns:
+            self.cycle_combo.set_selected(all_btns.index(current))
+        else:
+            self.cycle_combo.set_selected(0) # None
+            
+        self.cycle_combo.connect("notify::selected-item", self.on_cycle_button_selected)
+
+    def on_cycle_button_selected(self, drop, param):
+        if not self.current_scheme_name: return
+        item = drop.get_selected_item()
+        val = item.get_string() if item else "None"
         
-        # Clear
-        for child in list(self.axis_mapping_box)[1:]: self.axis_mapping_box.remove(child)
-        for child in list(self.btn_mapping_box)[1:]: self.btn_mapping_box.remove(child)
+        if val == "None":
+            self.node.scheme_cycle_buttons.pop(self.current_scheme_name, None)
+        else:
+            self.node.scheme_cycle_buttons[self.current_scheme_name] = val
+            # Clear button mapping if it was previously mapped to an output button in any mapping of this scheme
+            mappings = self.node.get_mappings_for_scheme(self.current_scheme_name)
+            for m in mappings:
+                for out_name, mapped_btn in list(m['buttons'].items()):
+                    if mapped_btn == val:
+                        m['buttons'].pop(out_name, None)
+                        
+        GLib.idle_add(self.rebuild_notebook_deferred)
+
+    def rebuild_notebook_deferred(self):
+        self.rebuild_notebook()
+        return False # Ensure only runs once
+
+    def rebuild_notebook(self):
+        # Block switch-page callback to prevent recursive triggers and state corruption
+        if hasattr(self, 'tab_switch_handler_id') and self.tab_switch_handler_id:
+            self.mapping_notebook.handler_block(self.tab_switch_handler_id)
+            
+        # Clear all pages
+        while self.mapping_notebook.get_n_pages() > 0:
+            self.mapping_notebook.remove_page(0)
+            
+        scheme_name = self.current_scheme_name
+        if not scheme_name or scheme_name not in self.node.control_schemes:
+            if hasattr(self, 'tab_switch_handler_id') and self.tab_switch_handler_id:
+                self.mapping_notebook.handler_unblock(self.tab_switch_handler_id)
+            return
+            
+        mappings = self.node.get_mappings_for_scheme(scheme_name)
+        active_idx = self.node.get_active_mapping_index_for_scheme(scheme_name)
         
         all_axes = self.get_all_available_signals('axis')
         all_btns = self.get_all_available_signals('button')
+        cycle_btn = self.node.scheme_cycle_buttons.get(scheme_name)
+        filtered_btns = [b for b in all_btns if b != cycle_btn]
         
-        axis_size_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
+        scheme = self.node.control_schemes[scheme_name]
+        
+        for i, mapping in enumerate(mappings):
+            page_widget = self.create_mapping_page_widget(scheme, mapping, all_axes, filtered_btns)
+            
+            # Custom Tab Label
+            tab_label_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+            lbl = Gtk.Label(label=f"Mapping {i+1}")
+            tab_label_box.append(lbl)
+            
+            if len(mappings) > 1:
+                close_btn = Gtk.Button(icon_name="window-close-symbolic")
+                close_btn.set_has_frame(False)
+                close_btn.connect("clicked", lambda b, idx=i: self.on_delete_tab_clicked(idx))
+                tab_label_box.append(close_btn)
+                
+            self.mapping_notebook.append_page(page_widget, tab_label_box)
+            
+        # Add the "+" Tab page
+        plus_page = Gtk.Box()
+        plus_lbl = Gtk.Label(label="+")
+        self.mapping_notebook.append_page(plus_page, plus_lbl)
+        
+        if active_idx < len(mappings):
+            self.mapping_notebook.set_current_page(active_idx)
+        else:
+            self.mapping_notebook.set_current_page(0)
+            self.node.scheme_active_indices[scheme_name] = 0
+            
+        if hasattr(self, 'tab_switch_handler_id') and self.tab_switch_handler_id:
+            self.mapping_notebook.handler_unblock(self.tab_switch_handler_id)
+
+    def on_tab_switched(self, notebook, page, page_num):
+        if not self.current_scheme_name: return
+        mappings = self.node.get_mappings_for_scheme(self.current_scheme_name)
+        
+        # If switched to the last page ("+")
+        if page_num == len(mappings):
+            new_mapping = {
+                'axes': {},
+                'buttons': {},
+                'sensitivities': {},
+                'inverted': {}
+            }
+            mappings.append(new_mapping)
+            self.node.scheme_active_indices[self.current_scheme_name] = len(mappings) - 1
+            GLib.idle_add(self.rebuild_notebook_deferred)
+        else:
+            self.node.scheme_active_indices[self.current_scheme_name] = page_num
+
+    def create_mapping_page_widget(self, scheme, mapping, all_axes, filtered_btns):
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_vexpand(True)
+        
+        cols_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
+        cols_box.set_margin_top(10)
+        cols_box.set_margin_bottom(10)
+        cols_box.set_margin_start(10)
+        cols_box.set_margin_end(10)
+        scrolled.set_child(cols_box)
+        
+        # Axis mapping box (Left)
+        axis_mapping_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        axis_mapping_box.set_hexpand(True)
+        axis_mapping_box.append(Gtk.Label(label="Axis Mapping", xalign=0))
+        cols_box.append(axis_mapping_box)
+        
+        lbl_size_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
+        drop_size_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
+        
         for axis_name in scheme['axis_names']:
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-            lbl = Gtk.Label(label=axis_name, xalign=1.0)
-            axis_size_group.add_widget(lbl)
-            drop = Gtk.DropDown.new_from_strings(all_axes)
-            # Set current if mapped
-            current = self.node.mapping['axes'].get(axis_name)
-            if current in all_axes: drop.set_selected(all_axes.index(current))
-            drop.connect("notify::selected-item", lambda d, p, n=axis_name: self.on_axis_mapped(n, d))
-            row.append(lbl)
-            row.append(drop)
-            self.axis_mapping_box.append(row)
             
-        btn_size_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
+            lbl = Gtk.Label(label=axis_name, xalign=1.0)
+            lbl_size_group.add_widget(lbl)
+            row.append(lbl)
+            
+            drop = Gtk.DropDown.new_from_strings(all_axes)
+            drop_size_group.add_widget(drop)
+            current = mapping['axes'].get(axis_name)
+            if current in all_axes:
+                drop.set_selected(all_axes.index(current))
+            drop.connect("notify::selected-item", lambda d, p, n=axis_name, m=mapping: self.on_axis_mapped_in_page(n, d, m))
+            row.append(drop)
+            
+            invert_chk = Gtk.CheckButton(label="Invert")
+            curr_invert = mapping.get('inverted', {}).get(axis_name, False)
+            invert_chk.set_active(curr_invert)
+            invert_chk.connect("toggled", lambda cb, n=axis_name, m=mapping: self.on_axis_inverted_toggled(n, cb, m))
+            row.append(invert_chk)
+            
+            curr_sens = mapping.get('sensitivities', {}).get(axis_name, 50)
+            sens_adj = Gtk.Adjustment.new(curr_sens, 0.0, 100.0, 1.0, 10.0, 0.0)
+            sens_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=sens_adj)
+            sens_scale.set_hexpand(True)
+            sens_scale.set_draw_value(False)
+            
+            sens_lbl = Gtk.Label(label=f"Sens: {int(curr_sens)}")
+            sens_lbl.set_width_chars(10)
+            
+            sens_scale.connect("value-changed", lambda s, n=axis_name, m=mapping, l=sens_lbl: self.on_axis_sensitivity_changed(n, s, m, l))
+            row.append(sens_scale)
+            row.append(sens_lbl)
+            
+            curr_db = mapping.get('deadbands', {}).get(axis_name, 0)
+            db_adj = Gtk.Adjustment.new(curr_db, 0.0, 100.0, 1.0, 10.0, 0.0)
+            db_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=db_adj)
+            db_scale.set_hexpand(True)
+            db_scale.set_draw_value(False)
+            
+            db_lbl = Gtk.Label(label=f"Dead: {curr_db / 100.0:.2f}")
+            db_lbl.set_width_chars(11)
+            
+            db_scale.connect("value-changed", lambda s, n=axis_name, m=mapping, l=db_lbl: self.on_axis_deadband_changed(n, s, m, l))
+            row.append(db_scale)
+            row.append(db_lbl)
+            
+            axis_mapping_box.append(row)
+            
+        # Button mapping box (Right)
+        btn_mapping_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        btn_mapping_box.set_hexpand(True)
+        btn_mapping_box.append(Gtk.Label(label="Button Mapping", xalign=0))
+        cols_box.append(btn_mapping_box)
+        
+        btn_lbl_size_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
+        
         for btn_name in scheme['button_names']:
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-            lbl = Gtk.Label(label=btn_name, xalign=1.0)
-            btn_size_group.add_widget(lbl)
-            drop = Gtk.DropDown.new_from_strings(all_btns)
-            current = self.node.mapping['buttons'].get(btn_name)
-            if current in all_btns: drop.set_selected(all_btns.index(current))
-            drop.connect("notify::selected-item", lambda d, p, n=btn_name: self.on_btn_mapped(n, d))
-            row.append(lbl)
-            row.append(drop)
-            self.btn_mapping_box.append(row)
-
-    def on_axis_mapped(self, out_name, drop):
-        item = drop.get_selected_item()
-        val = item.get_string() if item else "None"
-        if val == "None":
-            self.node.mapping['axes'].pop(out_name, None)
-        else:
-            self.node.mapping['axes'][out_name] = val
             
-    def on_btn_mapped(self, out_name, drop):
+            lbl = Gtk.Label(label=btn_name, xalign=1.0)
+            btn_lbl_size_group.add_widget(lbl)
+            row.append(lbl)
+            
+            drop = Gtk.DropDown.new_from_strings(filtered_btns)
+            current = mapping['buttons'].get(btn_name)
+            if current in filtered_btns:
+                drop.set_selected(filtered_btns.index(current))
+            drop.connect("notify::selected-item", lambda d, p, n=btn_name, m=mapping: self.on_btn_mapped_in_page(n, d, m))
+            row.append(drop)
+            
+            btn_mapping_box.append(row)
+            
+        return scrolled
+
+    def on_axis_mapped_in_page(self, out_name, drop, mapping):
         item = drop.get_selected_item()
         val = item.get_string() if item else "None"
         if val == "None":
-            self.node.mapping['buttons'].pop(out_name, None)
+            mapping['axes'].pop(out_name, None)
         else:
-            self.node.mapping['buttons'][out_name] = val
+            mapping['axes'][out_name] = val
+
+    def on_axis_inverted_toggled(self, out_name, check_btn, mapping):
+        if 'inverted' not in mapping:
+            mapping['inverted'] = {}
+        mapping['inverted'][out_name] = check_btn.get_active()
+
+    def on_axis_sensitivity_changed(self, out_name, scale, mapping, lbl):
+        val = int(scale.get_value())
+        lbl.set_text(f"Sens: {val}")
+        if 'sensitivities' not in mapping:
+            mapping['sensitivities'] = {}
+        mapping['sensitivities'][out_name] = val
+
+    def on_axis_deadband_changed(self, out_name, scale, mapping, lbl):
+        val = int(scale.get_value())
+        lbl.set_text(f"Dead: {val / 100.0:.2f}")
+        if 'deadbands' not in mapping:
+            mapping['deadbands'] = {}
+        mapping['deadbands'][out_name] = val
+
+    def on_btn_mapped_in_page(self, out_name, drop, mapping):
+        item = drop.get_selected_item()
+        val = item.get_string() if item else "None"
+        if val == "None":
+            mapping['buttons'].pop(out_name, None)
+        else:
+            mapping['buttons'][out_name] = val
+
+    def on_delete_tab_clicked(self, idx):
+        if not self.current_scheme_name: return
+        mappings = self.node.get_mappings_for_scheme(self.current_scheme_name)
+        if len(mappings) <= 1: return
+        
+        mappings.pop(idx)
+        
+        curr_idx = self.node.scheme_active_indices.get(self.current_scheme_name, 0)
+        if curr_idx >= len(mappings):
+            self.node.scheme_active_indices[self.current_scheme_name] = len(mappings) - 1
+        elif curr_idx > idx:
+            self.node.scheme_active_indices[self.current_scheme_name] = curr_idx - 1
+            
+        GLib.idle_add(self.rebuild_notebook_deferred)
+
+    def on_mapping_cycled_externally(self):
+        if not self.current_scheme_name: return False
+        active_idx = self.node.get_active_mapping_index_for_scheme(self.current_scheme_name)
+        if self.mapping_notebook.get_current_page() != active_idx:
+            if hasattr(self, 'tab_switch_handler_id') and self.tab_switch_handler_id:
+                self.mapping_notebook.handler_block(self.tab_switch_handler_id)
+            self.mapping_notebook.set_current_page(active_idx)
+            if hasattr(self, 'tab_switch_handler_id') and self.tab_switch_handler_id:
+                self.mapping_notebook.handler_unblock(self.tab_switch_handler_id)
+        return False
 
     def on_save_clicked(self, btn):
         data = {
@@ -899,7 +1254,8 @@ class MappingWindow(Gtk.Window):
                 'max_rate_hz': self.node.max_rate_hz,
                 'selected_scheme': self.node.selected_scheme
             },
-            'mapping': self.node.mapping,
+            'scheme_mappings': self.node.scheme_mappings,
+            'scheme_cycle_buttons': self.node.scheme_cycle_buttons,
             'constructed_inputs': {}
         }
         for name, c in list(self.node.constructions.items()):
@@ -966,8 +1322,10 @@ class MappingWindow(Gtk.Window):
             except Exception as e:
                 self.node.get_logger().error(f"Failed to load construction {name}: {e}")
         
-        # 2. Update Mapping
-        self.node.mapping.update(data.get('mapping', {}))
+        # 2. Update Mappings directly
+        self.node.scheme_mappings = data.get('scheme_mappings', {})
+        self.node.scheme_cycle_buttons = data.get('scheme_cycle_buttons', {})
+        self.node.scheme_active_indices = {} # Reset to 0 defaults on load
         
         # 3. Update Options
         opts = data.get('options', {})
@@ -980,13 +1338,38 @@ class MappingWindow(Gtk.Window):
         
         # 4. Refresh All Windows
         if self.node.selected_scheme:
-            self.update_mapping_ui(self.node.selected_scheme)
+            self.update_cycle_button_dropdown()
+            GLib.idle_add(self.rebuild_notebook_deferred)
         if self.app.const_mgmt_win:
             self.app.const_mgmt_win.refresh_list()
 
     def on_options_clicked(self, btn):
         dialog = OptionsDialog(self, self.node)
         dialog.present()
+
+    def on_monitor_clicked(self, btn):
+        if not self.app.monitor_win:
+            self.app.monitor_win = MonitorWindow(self.app, self.node)
+        self.app.monitor_win.present()
+
+    def on_const_clicked(self, btn):
+        if not self.app.const_mgmt_win:
+            self.app.const_mgmt_win = ConstructionManagementWindow(self.app, self.node)
+        self.app.const_mgmt_win.present()
+
+    def on_close_request(self, window):
+        if self.app.monitor_win:
+            try:
+                self.app.monitor_win.destroy()
+            except:
+                pass
+        if self.app.const_mgmt_win:
+            try:
+                self.app.const_mgmt_win.destroy()
+            except:
+                pass
+        self.app.quit()
+        return False
 
     def get_all_available_signals(self, signal_type):
         return self.app.get_all_available_signals(signal_type)

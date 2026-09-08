@@ -3,12 +3,32 @@ from rclpy.node import Node
 from sensor_msgs.msg import Joy
 from rcl_interfaces.msg import ParameterDescriptor
 from abc import ABC, abstractmethod
+from std_srvs.srv import Trigger
 
 class ControlSchemeNode(Node, ABC):
     def __init__(self, node_name, axis_names, button_names, **kwargs):
         super().__init__(node_name, **kwargs)
         self._axes = axis_names
         self._buttons = button_names
+        
+        self.active = True  # Active by default for standalone/backward-compatibility
+        
+        # Services to activate/deactivate
+        self.create_service(Trigger, f'{node_name}/activate', self._activate_callback)
+        self.create_service(Trigger, f'{node_name}/deactivate', self._deactivate_callback)
+        
+        # Wrap create_publisher to silence child class publishers when inactive
+        self_create_pub = super().create_publisher
+        def wrapped_create_publisher(msg_type, topic, qos_profile, **kwargs):
+            pub = self_create_pub(msg_type, topic, qos_profile, **kwargs)
+            original_publish = pub.publish
+            def wrapped_publish(msg):
+                if not self.active:
+                    return  # Ignore/Silence if inactive
+                return original_publish(msg)
+            pub.publish = wrapped_publish
+            return pub
+        self.create_publisher = wrapped_create_publisher
         
         # Declare read-only parameters for names in initialization
         self.declare_parameter(
@@ -30,6 +50,20 @@ class ControlSchemeNode(Node, ABC):
             1
         )
 
+    def _activate_callback(self, request, response):
+        self.active = True
+        response.success = True
+        response.message = f"Control scheme {self.get_name()} activated."
+        self.get_logger().info(response.message)
+        return response
+
+    def _deactivate_callback(self, request, response):
+        self.active = False
+        response.success = True
+        response.message = f"Control scheme {self.get_name()} deactivated."
+        self.get_logger().info(response.message)
+        return response
+
     @property
     def control_axes(self):
         """Returns the list of names for control axes."""
@@ -41,6 +75,8 @@ class ControlSchemeNode(Node, ABC):
         return self._buttons
 
     def _joy_callback(self, msg: Joy):
+        if not self.active:
+            return
         # Check if length matching with the names
         axes_len = len(self.control_axes)
         buttons_len = len(self.control_buttons)
