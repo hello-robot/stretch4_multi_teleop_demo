@@ -75,7 +75,7 @@ def generate_launch_description():
             }],
             arguments=['-c', PathJoinSubstitution([pkg_share, 'config', 'hands_config.yaml'])]
         ),
-
+        
         # 3. Single Hand Tracker (tracking right hand by default in this launch)
         Node(
             package='teleop_interfaces',
