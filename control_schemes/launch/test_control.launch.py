@@ -1,3 +1,7 @@
+"""Launches sim_direct_position_control (MuJoCo sim) and teleop_interfaces' gui_node,
+wired to feed the sim node's input topic.
+"""
+
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -12,8 +16,8 @@ def generate_launch_description():
     return LaunchDescription([
         Node(
             package='control_schemes',
-            executable='direct_position_control',
-            name='direct_position_control',
+            executable='sim_direct_position_control',
+            name='sim_direct_position_control',
             output='screen'
         ),
         Node(
@@ -23,7 +27,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{'config_file': gui_config}],
             remappings=[
-                ('gui_node/output', 'direct_position_control/input')
+                ('gui_node/output', 'sim_direct_position_control/input')
             ]
         )
     ])

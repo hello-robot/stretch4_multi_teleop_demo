@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""StretchControlNode: 9-axis position/velocity/mixed joystick control scheme.
+
+Publishes to /joint_position_cmd, /joint_velocity_cmd, /cmd_vel, and pushes
+matching joint modes to a discovered driver node via its set_parameters service.
+"""
 
 import sys
 import argparse
@@ -10,7 +15,18 @@ from geometry_msgs.msg import Twist
 from multi_teleop.base import ControlSchemeNode
 
 class StretchControlNode(ControlSchemeNode):
+    """Joystick control scheme for direct joint position/velocity/mixed control.
+
+    One node class backs three entry-point modes (position/velocity/mixed),
+    selected via the ``mode`` constructor arg or ``--mode`` CLI flag.
+    """
+
     def __init__(self, mode="position"):
+        """Builds the node in the given mode ("position", "velocity", or "mixed").
+
+        Args:
+            mode (str): Which control mode's axes/buttons/topics to set up.
+        """
         self._mode = mode
         
         # Define the 9 axes as required
@@ -50,9 +66,11 @@ class StretchControlNode(ControlSchemeNode):
         self.declare_parameter("limit.wrist_yaw.lower", -1.047)
         self.declare_parameter("limit.wrist_yaw.upper", 1.047)
         
-        # Gripper: 0.0 to 0.15 as requested
+        # Gripper: full aperture-open angle in radians (~0.849, from aperture_open_m/finger_length_m
+        # in robot_params_SE4.py) -- the driver's "stretch_gripper" position unit, matching its own
+        # /joint_states readback (gripper_finger_left_joint + gripper_finger_right_joint).
         self.declare_parameter("limit.gripper.lower", 0.0)
-        self.declare_parameter("limit.gripper.upper", 0.15)
+        self.declare_parameter("limit.gripper.upper", 0.85)
         
         # Declare parameters for joint velocity scaling limits
         self.declare_parameter("max_joint_vel.lift", 0.2)
@@ -60,6 +78,7 @@ class StretchControlNode(ControlSchemeNode):
         self.declare_parameter("max_joint_vel.wrist_roll", 1.0)
         self.declare_parameter("max_joint_vel.wrist_pitch", 1.0)
         self.declare_parameter("max_joint_vel.wrist_yaw", 1.0)
+        self.declare_parameter("max_joint_vel.gripper", 1.0)
         
         # Publishers
         self.pos_pub = self.create_publisher(JointState, "/joint_position_cmd", 10)
@@ -116,7 +135,7 @@ class StretchControlNode(ControlSchemeNode):
             return
             
         params = []
-        for joint in ["lift", "arm", "wrist_roll", "wrist_pitch", "wrist_yaw"]:
+        for joint in ["lift", "arm", "wrist_roll", "wrist_pitch", "wrist_yaw", "stretch_gripper"]:
             p = ParamMsg()
             p.name = f"joint_mode.{joint}"
             p.value = ParameterValue(
@@ -124,16 +143,7 @@ class StretchControlNode(ControlSchemeNode):
                 string_value="position" if target_is_pos else "velocity"
             )
             params.append(p)
-            
-        # Gripper is always position mode since velocity mode is unsafe/unavailable
-        p_grip = ParamMsg()
-        p_grip.name = "joint_mode.stretch_gripper"
-        p_grip.value = ParameterValue(
-            type=ParameterType.PARAMETER_STRING,
-            string_value="position"
-        )
-        params.append(p_grip)
-        
+
         req = SetParameters.Request()
         req.parameters = params
         
@@ -152,6 +162,11 @@ class StretchControlNode(ControlSchemeNode):
         future.add_done_callback(done_cb)
 
     def is_position_control_mode(self, buttons):
+        """Returns whether position control is active for the current mode/buttons.
+
+        Args:
+            buttons (list): Latest button states; only used in "mixed" mode.
+        """
         if self._mode == "position":
             return True
         elif self._mode == "velocity":
@@ -163,11 +178,23 @@ class StretchControlNode(ControlSchemeNode):
         return False
 
     def map_range(self, val, joint_name):
+        """Maps a joystick axis value in [-1, 1] to joint_name's declared position limits.
+
+        Args:
+            val (float): Axis value in [-1, 1].
+            joint_name (str): Joint whose declared limit.<name>.lower/upper to use.
+        """
         lower = self.get_parameter(f"limit.{joint_name}.lower").value
         upper = self.get_parameter(f"limit.{joint_name}.upper").value
         return (val + 1.0) / 2.0 * (upper - lower) + lower
 
     def handle_joy(self, axes: list, buttons: list):
+        """Publishes base twist and (position- or velocity-mode) joint commands from Joy input.
+
+        Args:
+            axes (list): 9 axis values (lift, base x/y/theta, arm, wrist rpy, gripper).
+            buttons (list): Mode-dependent buttons; only "Hold for Position Control" in mixed mode.
+        """
         if len(axes) < 9:
             self.get_logger().warn(f"Expected at least 9 axes, got {len(axes)}")
             return
@@ -204,34 +231,30 @@ class StretchControlNode(ControlSchemeNode):
             # Compliant with prompt: also publish to velocity command (zero velocity) to stop any velocity drift
             vel_msg = JointState()
             vel_msg.header.stamp = self.get_clock().now().to_msg()
-            vel_msg.name = ["lift", "arm", "wrist_roll", "wrist_pitch", "wrist_yaw"]
-            vel_msg.velocity = [0.0] * 5
+            vel_msg.name = ["lift", "arm", "wrist_roll", "wrist_pitch", "wrist_yaw", "stretch_gripper"]
+            vel_msg.velocity = [0.0] * 6
             self.vel_pub.publish(vel_msg)
         else:
             # Velocity control: Publish velocities
             vel_msg = JointState()
             vel_msg.header.stamp = self.get_clock().now().to_msg()
-            vel_msg.name = ["lift", "arm", "wrist_roll", "wrist_pitch", "wrist_yaw"]
+            vel_msg.name = ["lift", "arm", "wrist_roll", "wrist_pitch", "wrist_yaw", "stretch_gripper"]
             vel_msg.velocity = [
                 float(axes[0] * self.get_parameter("max_joint_vel.lift").value),
                 float(axes[4] * self.get_parameter("max_joint_vel.arm").value),
                 float(-1*axes[5] * self.get_parameter("max_joint_vel.wrist_roll").value),
                 float(-1*axes[6] * self.get_parameter("max_joint_vel.wrist_pitch").value),
                 float(-1*axes[7] * self.get_parameter("max_joint_vel.wrist_yaw").value),
+                float(axes[8] * self.get_parameter("max_joint_vel.gripper").value),
             ]
             self.vel_pub.publish(vel_msg)
-            
-            # Gripper is always position controlled
-            pos_msg = JointState()
-            pos_msg.header.stamp = self.get_clock().now().to_msg()
-            pos_msg.name = ["stretch_gripper"]
-            pos_msg.position = [self.map_range(axes[8], "gripper")]
-            self.pos_pub.publish(pos_msg)
 
 def make_node(mode):
+    """Constructs a StretchControlNode in the given mode."""
     return StretchControlNode(mode=mode)
 
 def main_position(args=None):
+    """Entry point: spins a StretchControlNode fixed in position-control mode."""
     rclpy.init(args=args)
     node = make_node("position")
     try:
@@ -243,6 +266,7 @@ def main_position(args=None):
         rclpy.shutdown()
 
 def main_velocity(args=None):
+    """Entry point: spins a StretchControlNode fixed in velocity-control mode."""
     rclpy.init(args=args)
     node = make_node("velocity")
     try:
@@ -254,6 +278,7 @@ def main_velocity(args=None):
         rclpy.shutdown()
 
 def main_mixed(args=None):
+    """Entry point: spins a StretchControlNode in mixed (button-toggled) mode."""
     rclpy.init(args=args)
     node = make_node("mixed")
     try:
@@ -265,6 +290,7 @@ def main_mixed(args=None):
         rclpy.shutdown()
 
 def main(args=None):
+    """Entry point: parses --mode from argv and spins a StretchControlNode."""
     parser = argparse.ArgumentParser(description="Stretch control scheme node.")
     parser.add_argument("--mode", "-m", choices=["position", "velocity", "mixed"], default="position")
     parsed_args, unknown = parser.parse_known_args()

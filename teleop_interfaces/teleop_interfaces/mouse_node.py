@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""ROS2 node publishing Joy messages from the system mouse (position, scroll, clicks)."""
 import rclpy
 from multi_teleop.base import InputInterfaceNode
 from pynput import mouse
@@ -6,7 +7,10 @@ import threading
 import tkinter as tk
 
 class MouseNode(InputInterfaceNode):
+    """Tracks absolute mouse position/scroll/clicks via pynput and publishes them as Joy."""
+
     def __init__(self):
+        """Detect screen size, start the pynput listener, and start the publish timer."""
         axis_names = ['x', 'y', 'scroll']
         button_names = ['left_click', 'right_click']
         super().__init__('mouse', axis_names, button_names)
@@ -47,6 +51,7 @@ class MouseNode(InputInterfaceNode):
         self.timer = self.create_timer(0.02, self.update_and_publish)
 
     def _on_move(self, x, y):
+        """Pynput callback: normalize absolute cursor position to [-1, 1] per axis."""
         width = self.get_parameter('screen_width').value
         height = self.get_parameter('screen_height').value
         
@@ -59,6 +64,7 @@ class MouseNode(InputInterfaceNode):
             self._current_y = max(-1.0, min(1.0, self._current_y))
 
     def _on_click(self, x, y, button, pressed):
+        """Pynput callback: update left/right button press state."""
         with self.lock:
             if button == mouse.Button.left:
                 self._left_pressed = 1 if pressed else 0
@@ -66,6 +72,10 @@ class MouseNode(InputInterfaceNode):
                 self._right_pressed = 1 if pressed else 0
 
     def _on_scroll(self, x, y, dx, dy):
+        """Pynput callback: accumulate scroll delta into the scroll axis, clamped to [-1, 1].
+
+        Note: the accumulator never decays back toward 0 (see findings doc).
+        """
         scale = self.get_parameter('scroll_scale').value
         with self.lock:
             # dy is positive for up, negative for down
@@ -74,6 +84,7 @@ class MouseNode(InputInterfaceNode):
             self._scroll_value = max(-1.0, min(1.0, self._scroll_value))
 
     def update_and_publish(self):
+        """Timer callback: publish the current position/scroll/click state as Joy."""
         with self.lock:
             axes = [self._current_x, self._current_y, self._scroll_value]
             buttons = [self._left_pressed, self._right_pressed]
@@ -86,10 +97,12 @@ class MouseNode(InputInterfaceNode):
             self.publish_input(axes, buttons)
 
     def stop(self):
+        """Stop the pynput mouse listener, if one was started."""
         if hasattr(self, 'listener'):
             self.listener.stop()
 
 def main(args=None):
+    """Entry point: construct MouseNode and spin until interrupted."""
     rclpy.init(args=args)
     node = None
     try:

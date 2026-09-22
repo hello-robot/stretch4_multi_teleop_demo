@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
+"""ROS2 node publishing Joy messages from an Xbox-360-style USB gamepad via evdev."""
 import rclpy
 from multi_teleop.base import InputInterfaceNode
 import evdev
 from evdev import ecodes
 import threading
 import time
+import math
 
 class GamepadNode(InputInterfaceNode):
+    """Polls an evdev gamepad in a background thread and publishes Joy state."""
+
     def __init__(self):
+        """Declare gamepad parameters, then start the connect/poll thread and publish timer."""
         # Default Xbox 360 controller layouts
         axis_names = [
             'Left Stick X', 'Left Stick Y', 'Left Trigger',
@@ -68,6 +73,7 @@ class GamepadNode(InputInterfaceNode):
         self.timer = self.create_timer(poll_rate, self.update_and_publish)
 
     def _connect_gamepad(self):
+        """Open the configured device_path, or auto-detect a pad/xbox/controller device."""
         device_path = self.get_parameter('device_path').value
         if device_path:
             try:
@@ -89,11 +95,17 @@ class GamepadNode(InputInterfaceNode):
                 self.get_logger().error(f"Error listing input devices: {e}")
 
     def _run(self):
+        """Background-thread loop: (re)connect and read evdev events until stopped."""
         while rclpy.ok() and not self._stop_thread:
             if self.device is None:
                 self._connect_gamepad()
                 if self.device is None:
-                    time.sleep(2.0)
+                    # Sleep in short increments so stop() can join promptly
+                    # instead of waiting out the full retry interval.
+                    for _ in range(20):
+                        if self._stop_thread:
+                            break
+                        time.sleep(0.1)
                     continue
 
             try:
@@ -110,6 +122,7 @@ class GamepadNode(InputInterfaceNode):
                 time.sleep(1.0)
 
     def _process_event(self, event):
+        """Update cached button/axis state from one evdev key or abs event."""
         if event.type == ecodes.EV_KEY:
             if event.code in self.BUTTON_MAP:
                 idx = self.BUTTON_MAP[event.code]
@@ -129,13 +142,13 @@ class GamepadNode(InputInterfaceNode):
                     if abs(val) < deadzone:
                         val = 0.0
                     else:
-                        import math
                         val = math.copysign((abs(val) - deadzone) / (1.0 - deadzone), val)
                 
                 with self.lock:
                     self._current_axes[idx] = val
 
     def update_and_publish(self):
+        """Timer callback: publish a snapshot of the current axis/button state."""
         with self.lock:
             # Make a copy to avoid race conditions
             axes = list(self._current_axes)
@@ -143,9 +156,18 @@ class GamepadNode(InputInterfaceNode):
         self.publish_input(axes, buttons)
 
     def stop(self):
+        """Signal the background poll thread to exit, then join it and close the device."""
         self._stop_thread = True
+        if self.device is not None:
+            try:
+                self.device.close()
+            except Exception:
+                pass
+        if self.thread.is_alive():
+            self.thread.join(timeout=2.0)
 
 def main(args=None):
+    """Entry point: construct GamepadNode and spin until interrupted."""
     rclpy.init(args=args)
     node = None
     try:

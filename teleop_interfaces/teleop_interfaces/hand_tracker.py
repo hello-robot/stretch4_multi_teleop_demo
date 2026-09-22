@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Single-hand MediaPipe tracker: publishes one hand's wrist pose as a 6DOF Joy signal."""
 import rclpy
 from teleop_interfaces.mediapipe_base import MediaPipeBaseNode
 import mediapipe as mp
@@ -8,7 +9,10 @@ import numpy as np
 import cv2
 
 class HandTracker(MediaPipeBaseNode):
+    """Tracks a single hand (left or right, selectable) via MediaPipe HandLandmarker."""
+
     def __init__(self, config_path):
+        """Set up the 21 hand landmark point names and, if model_path is set, the detector."""
         hand_lms = [
             'WRIST', 'THUMB_CMC', 'THUMB_MCP', 'THUMB_IP', 'THUMB_TIP',
             'INDEX_FINGER_MCP', 'INDEX_FINGER_PIP', 'INDEX_FINGER_DIP', 'INDEX_FINGER_TIP',
@@ -31,6 +35,13 @@ class HandTracker(MediaPipeBaseNode):
         self.detector = vision.HandLandmarker.create_from_options(options)
 
     def process_frame(self, frame):
+        """Detect hands, select the configured hand_to_track, and derive a 6DOF pose.
+
+        Returns:
+            [x, y, z, roll=0, pitch, yaw=0] from the wrist landmark, or None if
+            no matching hand is detected. pitch is the image-plane angle of the
+            wrist-to-middle-finger-MCP vector, not a true 3D pitch.
+        """
         if not hasattr(self, 'detector'):
             return None
             
@@ -71,6 +82,7 @@ class HandTracker(MediaPipeBaseNode):
         return [x, y, z, roll, pitch, yaw]
 
 def main(args=None):
+    """Entry point: parse --config, construct HandTracker, and spin until interrupted."""
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--config', help='Path to config file')

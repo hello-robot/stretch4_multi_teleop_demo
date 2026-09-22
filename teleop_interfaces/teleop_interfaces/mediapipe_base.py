@@ -1,10 +1,37 @@
+"""Shared base node for MediaPipe camera trackers, plus a minimal numpy-only CvBridge.
+
+Provides MediaPipeBaseNode (webcam/topic capture, 6DOF workspace normalization,
+config-driven "virtual" axis/button distances, and OpenCV visualization) used by
+hand_tracker, hands_tracker, and head_face_tracker.
+"""
 # Replaced cv_bridge with a pure Python/NumPy implementation to support NumPy 2.x
 import rclpy
 from multi_teleop.base import InputInterfaceNode
 from sensor_msgs.msg import Image, Joy
+import mediapipe as mp
+import cv2
+import numpy as np
+import yaml
+import json
+import threading
+import time
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
+from rclpy.parameter import Parameter
+from abc import abstractmethod
 
 class CvBridge:
+    """Minimal drop-in replacement for cv_bridge.CvBridge (bgr8-family decode only)."""
+
     def imgmsg_to_cv2(self, msg, desired_encoding="bgr8"):
+        """Convert a sensor_msgs/Image to a bgr8 numpy array.
+
+        Args:
+            msg: sensor_msgs/Image with encoding in {rgb8, bgr8, rgba8, bgra8,
+                mono8, mono16/16UC1}.
+            desired_encoding: only "bgr8" is supported; anything else raises.
+        Returns:
+            HxWx3 uint8 numpy array in BGR order.
+        """
         if desired_encoding != "bgr8":
             raise NotImplementedError(f"Encoding '{desired_encoding}' is not supported.")
         
@@ -69,32 +96,39 @@ class CvBridge:
         else:
             raise ValueError(f"Cannot convert encoding {msg.encoding} to bgr8")
 
-import mediapipe as mp
-import cv2
-import numpy as np
-import yaml
-import json
-import threading
-import time
-from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
-from rclpy.parameter import Parameter
-from abc import abstractmethod
-
 class MediaPipeBaseNode(InputInterfaceNode):
+    """Base class for camera-driven trackers: capture, normalize to 6DOF, publish Joy.
+
+    Subclasses set `self._point_names` before calling super().__init__() and
+    implement `process_frame()` to return a 6DOF pose or None.
+    """
+
     def __init__(self, node_name, config_path=None, **kwargs):
+        """Load optional virtual-item config, declare parameters, and start capture.
+
+        Args:
+            node_name: ROS node name, forwarded to InputInterfaceNode.
+            config_path: optional YAML path with a 'virtual_sensors' list.
+        """
         # 6DOF base axes are always present: x, y, z, roll, pitch, yaw
         self._axes = ['x', 'y', 'z', 'roll', 'pitch', 'yaw']
         self._buttons = []
         self._last_axes = [0.0 for n in self._axes]
         self._last_buttons = [0.0 for n in self._buttons]
         self._virtual_config = [] # List of {name, p1, p2, type, threshold/max_dist}
-        
+        # True once this Node (and its axis_names/button_names parameters)
+        # exist, so add_virtual_item knows whether it can update those
+        # declared parameters in place (it's also called before super().__init__()
+        # below, while loading the initial config, when there is no Node yet).
+        self._ros_ready = False
+
         # Load config if provided
         if config_path:
             self._load_config(config_path)
 
         super().__init__(node_name, self._axes, self._buttons, **kwargs)
-        
+        self._ros_ready = True
+
         self.declare_parameter('use_webcam', True)
         self.declare_parameter('webcam_id', 0)
         self.declare_parameter('image_topic', '/image_raw')
@@ -144,6 +178,7 @@ class MediaPipeBaseNode(InputInterfaceNode):
         
 
     def _load_config(self, path):
+        """Load 'virtual_sensors' entries from a YAML file, if present, via add_virtual_item."""
         if path is None:
             return
         try:
@@ -156,6 +191,7 @@ class MediaPipeBaseNode(InputInterfaceNode):
             print(f"WARNING: Failed to load config from {path}: {e}")
 
     def _on_params_changed(self, params):
+        """ROS parameter callback: add a virtual item from an 'add_virtual_item_json' param."""
         for param in params:
             if param.name == 'add_virtual_item_json' and param.type_ == rclpy.Parameter.Type.STRING:
                 try:
@@ -166,22 +202,58 @@ class MediaPipeBaseNode(InputInterfaceNode):
         return SetParametersResult(successful=True)
 
     def add_virtual_item(self, item):
-        """
-        item: {name, p1, p2, type: 'axis'|'button', max_dist/threshold}
+        """Register a landmark-distance-derived virtual axis or button.
+
+        If called after construction (e.g. from the 'add_virtual_item_json'
+        parameter callback), also updates the declared 'axis_names'/
+        'button_names' ROS parameters so tools like interface_monitor.py see
+        the new name instead of a stale list.
+
+        Args:
+            item: dict with name, p1, p2, type ('axis'|'button'), and
+                max_dist/min_dist (axis) or threshold (button).
         """
         name = item.get('name')
         if not name: return
-        
-        if item['type'] == 'axis':
+
+        item_type = item.get('type')
+        if item_type == 'axis':
             if name not in self._axes:
                 self._axes.append(name)
                 self._last_axes.append(0.0) # Initial value for distance-based axis
                 self._virtual_config.append(item)
-        elif item['type'] == 'button':
+                self._sync_names_param('axis_names', self._axes)
+        elif item_type == 'button':
             if name not in self._buttons:
                 self._buttons.append(name)
                 self._last_buttons.append(0)
                 self._virtual_config.append(item)
+                self._sync_names_param('button_names', self._buttons)
+        else:
+            self._warn_or_print(
+                f"add_virtual_item: unrecognized item type {item_type!r} for "
+                f"'{name}'; ignoring.")
+
+    def _sync_names_param(self, param_name, names):
+        """Update a declared axis_names/button_names parameter to match `names`.
+
+        No-op if called before this node's parameters exist yet (during the
+        initial config load in __init__, super().__init__() hasn't declared
+        them - they'll already reflect `names` once it does).
+        """
+        if not self._ros_ready:
+            return
+        try:
+            self.set_parameters([Parameter(param_name, Parameter.Type.STRING_ARRAY, list(names))])
+        except Exception as e:
+            self._warn_or_print(f"Failed to update '{param_name}' parameter: {e}")
+
+    def _warn_or_print(self, msg):
+        """Log a warning via the ROS logger if available, else print (pre-construction)."""
+        if self._ros_ready:
+            self.get_logger().warn(msg)
+        else:
+            print(f"WARNING: {msg}")
 
 
     @abstractmethod
@@ -190,7 +262,7 @@ class MediaPipeBaseNode(InputInterfaceNode):
         pass
 
     def update_and_publish(self):
-        """Implementation of InputInterfaceNode's abstract method."""
+        """Timer callback (webcam mode): grab one frame and process/publish it."""
         if self.get_parameter('use_webcam').value:
             ret, frame = self._cap.read()
             if ret:
@@ -202,10 +274,12 @@ class MediaPipeBaseNode(InputInterfaceNode):
         self.update_and_publish()
 
     def _image_callback(self, msg):
+        """Image subscription callback (topic mode): stash the latest message only."""
         with self._msg_lock:
             self._latest_msg = msg
 
     def _processing_loop(self):
+        """Background-thread loop (topic mode): process the latest frame as it arrives."""
         while rclpy.ok() and not self._stop_event.is_set():
             msg = None
             with self._msg_lock:
@@ -232,6 +306,7 @@ class MediaPipeBaseNode(InputInterfaceNode):
                 self.get_logger().error(f"Processing error: {e}")
 
     def _update_fps(self):
+        """Update the exponential-moving-average FPS estimate used in visualization."""
         now = self.get_clock().now()
         dt = (now - self._last_time).nanoseconds / 1e9
         if dt > 0:
@@ -240,6 +315,10 @@ class MediaPipeBaseNode(InputInterfaceNode):
         self._last_time = now
 
     def _handle_frame(self, frame):
+        """Run process_frame, normalize the 6DOF pose + virtual items, and publish Joy.
+
+        Shows the raw frame (if visualize) when process_frame returns None.
+        """
         state_6dof = self.process_frame(frame)
         if state_6dof is None:
             if self.get_parameter('visualize').value:
@@ -333,6 +412,7 @@ class MediaPipeBaseNode(InputInterfaceNode):
             self._draw_visualization(frame, state_6dof, zero, ws_min, ws_max, v_viz_data)
 
     def _draw_visualization(self, frame, state, zero, ws_min, ws_max, v_viz_data):
+        """Render the debug overlay (workspace box, 6DOF panel, virtual items) via OpenCV."""
         h, w, _ = frame.shape
         
         # Viridis-inspired Palette (BGR)

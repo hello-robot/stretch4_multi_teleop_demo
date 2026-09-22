@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""Teleop Orchestrator: routes Joy signals from inputs to control schemes.
+
+Runs ``OrchestratorNode``, which dynamically discovers input-interface
+and control-scheme nodes over ROS, lets the user map/scale/invert their
+signals (optionally through virtual ``Construction`` signals), and
+publishes the routed ``sensor_msgs/msg/Joy`` to the selected scheme.
+An optional GTK4/Adwaita UI (``OrchestratorUI`` and friends) drives this
+interactively; see AGENT_GUIDE.md for the architecture overview.
+"""
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Joy
@@ -18,24 +27,40 @@ from gi.repository import Gtk, Gio, GLib, Adw, Pango, Gdk
 # --- Construction Logic Classes ---
 
 class SignalSource:
+    """Named leaf lookup into the orchestrator's signal pool."""
+
     def __init__(self, name):
         self.name = name
     def evaluate(self, pool):
+        """Return ``pool[self.name]``, or 0.0 if not present."""
         return pool.get(self.name, 0.0)
 
 class Construction:
+    """Abstract base for a virtual signal derived from other signals.
+
+    Subclasses compute an axis or button value from one or more named
+    inputs looked up in the shared signal pool each control-loop tick.
+    """
+
     def __init__(self, name, out_type):
         self.name = name
         self.out_type = out_type # 'axis' or 'button'
         self.inputs = [] # list of signal names
-    
+
     def evaluate(self, pool):
+        """Compute this construction's value from ``pool``.
+
+        Must be overridden by subclasses; raising here is intentional.
+        """
         raise NotImplementedError()
-    
+
     def get_dependencies(self):
+        """Return the names of signals this construction reads from."""
         return self.inputs
 
 class AxisToButton(Construction):
+    """Fires (1) when an input axis exceeds a cutoff, else 0."""
+
     def __init__(self, name, axis_name, cutoff):
         super().__init__(name, 'button')
         self.inputs = [axis_name]
@@ -45,6 +70,8 @@ class AxisToButton(Construction):
         return 1 if val > self.cutoff else 0
 
 class ButtonToAxis(Construction):
+    """Maps a button (0/1) to a configurable axis low/high value pair."""
+
     def __init__(self, name, button_name, low=0.0, high=1.0):
         super().__init__(name, 'axis')
         self.inputs = [button_name]
@@ -54,6 +81,8 @@ class ButtonToAxis(Construction):
         return self.high if pool.get(self.inputs[0], 0) else self.low
 
 class TwoButtonsToAxis(Construction):
+    """Combines a negative/positive button pair into a -1/0/1 axis."""
+
     def __init__(self, name, btn_neg, btn_pos):
         super().__init__(name, 'axis')
         self.inputs = [btn_neg, btn_pos]
@@ -65,6 +94,8 @@ class TwoButtonsToAxis(Construction):
         return 0.0
 
 class AverageAxis(Construction):
+    """Averages two input axes."""
+
     def __init__(self, name, axis1, axis2):
         super().__init__(name, 'axis')
         self.inputs = [axis1, axis2]
@@ -72,6 +103,8 @@ class AverageAxis(Construction):
         return (pool.get(self.inputs[0], 0.0) + pool.get(self.inputs[1], 0.0)) / 2.0
 
 class InvertAxis(Construction):
+    """Negates an input axis."""
+
     def __init__(self, name, axis_name):
         super().__init__(name, 'axis')
         self.inputs = [axis_name]
@@ -79,6 +112,8 @@ class InvertAxis(Construction):
         return -pool.get(self.inputs[0], 0.0)
 
 class SquareAxis(Construction):
+    """Squares an input axis, preserving its original sign."""
+
     def __init__(self, name, axis_name):
         super().__init__(name, 'axis')
         self.inputs = [axis_name]
@@ -87,6 +122,8 @@ class SquareAxis(Construction):
         return math.copysign(val * val, val)
 
 class SqrtAxis(Construction):
+    """Square-roots |axis|, preserving the original sign."""
+
     def __init__(self, name, axis_name):
         super().__init__(name, 'axis')
         self.inputs = [axis_name]
@@ -95,8 +132,20 @@ class SqrtAxis(Construction):
         return math.copysign(math.sqrt(abs(val)), val)
 
 class LogicalButton(Construction):
+    """Boolean gate (AND/OR/NAND/NOR/NOT) over one or two buttons.
+
+    ``op == 'NOT'`` iff ``b2 is None`` -- any other combination is
+    rejected here in ``__init__`` (rather than failing later inside
+    ``evaluate`` with an ``IndexError`` when a binary op is missing its
+    second input).
+    """
+
     def __init__(self, name, b1, b2, op):
         super().__init__(name, 'button')
+        if op == 'NOT' and b2 is not None:
+            raise ValueError("LogicalButton: b2 must be None when op is 'NOT'")
+        if op != 'NOT' and b2 is None:
+            raise ValueError(f"LogicalButton: b2 is required when op is not 'NOT' (got op={op!r})")
         self.inputs = [b1, b2] if b2 else [b1]
         self.op = op # AND, OR, NAND, NOR, NOT
     def evaluate(self, pool):
@@ -111,6 +160,8 @@ class LogicalButton(Construction):
         return 0
 
 class AxisOverride(Construction):
+    """Passes a secondary axis through while the primary is near-zero."""
+
     def __init__(self, name, primary, secondary, threshold):
         super().__init__(name, 'axis')
         self.inputs = [primary, secondary]
@@ -121,6 +172,8 @@ class AxisOverride(Construction):
         return s if abs(p) < self.threshold else p
 
 class ButtonOverride(Construction):
+    """Passes button 2 through only while button 1 (priority) is 0."""
+
     def __init__(self, name, b1, b2):
         super().__init__(name, 'button')
         self.inputs = [b1, b2]
@@ -130,6 +183,8 @@ class ButtonOverride(Construction):
         return v2 if v1 == 0 else v1
 
 class DeadbandAxis(Construction):
+    """Zeroes an axis within [low, high] and linearly remaps outside it."""
+
     def __init__(self, name, axis_name, low, high):
         super().__init__(name, 'axis')
         self.inputs = [axis_name]
@@ -137,15 +192,27 @@ class DeadbandAxis(Construction):
         self.high = high
     def evaluate(self, pool):
         val = pool.get(self.inputs[0], 0.0)
+        # Axes are expected in [-1, 1]; clamp defensively so a
+        # miscalibrated device or an out-of-range upstream construction
+        # can't divide by zero below when high==1.0 or low==-1.0.
+        val = max(-1.0, min(1.0, val))
         if self.low <= val <= self.high:
             return 0.0
         if val > self.high:
-            return (val - self.high) / (1.0 - self.high)
+            denom = 1.0 - self.high
+            if denom <= 0.0:
+                return 0.0
+            return (val - self.high) / denom
         if val < self.low:
-            return (val - self.low) / (-1.0 - self.low) * -1.0 # Linear remap to -1, 0
+            denom = -1.0 - self.low
+            if denom >= 0.0:
+                return 0.0
+            return (val - self.low) / denom * -1.0 # Linear remap to -1, 0
         return 0.0
 
 class AxisButtonControl(Construction):
+    """Gates an axis by a button: START/STOP-when-pressed, or TOGGLE."""
+
     def __init__(self, name, axis_name, button_name, mode):
         super().__init__(name, 'axis')
         self.inputs = [axis_name, button_name]
@@ -170,7 +237,16 @@ class AxisButtonControl(Construction):
 # --- Orchestrator Node ---
 
 class OrchestratorNode(Node):
+    """Discovers inputs/schemes, maps signals, and republishes to Joy.
+
+    Runs discovery (2s) and process-and-publish (30Hz) timers. Holds all
+    routing state: discovered ``inputs``/``control_schemes``, per-scheme
+    ``scheme_mappings`` (with sensitivity/deadband/invert), virtual
+    ``constructions``, and the currently ``selected_scheme``.
+    """
+
     def __init__(self):
+        """Initialize routing state and start the discovery/publish timers."""
         super().__init__('teleop_orchestrator')
         self.get_logger().info("=============================================")
         self.get_logger().info("Teleop Orchestrator Version 2.0 (Multi-Mapping, Sensitivity, Invert) Initialized!")
@@ -185,12 +261,21 @@ class OrchestratorNode(Node):
         
         # Track nodes currently being queried to avoid duplicate threads
         self.checking_nodes = set()
-        
+
+        # Guards self.inputs/self.control_schemes/self.checking_nodes, which are
+        # written from both the ROS spin thread (timers/callbacks) and the daemon
+        # discovery threads spawned below.
+        self._discovery_lock = threading.RLock()
+
         # Options
         self.throttling_enabled = False
         self.periodic_publish = False
         self.max_rate_hz = 30.0
         self.last_publish_time = 0.0
+        # Last-published output, used to detect "no change" for the
+        # non-periodic throttling mode below (see process_and_publish).
+        self._last_published_axes = None
+        self._last_published_buttons = None
         
         # Discovery timer
         self.create_timer(2.0, self.discover_environment)
@@ -208,6 +293,7 @@ class OrchestratorNode(Node):
         self.app = None # Reference to OrchestratorUI
 
     def get_mappings_for_scheme(self, scheme_name):
+        """Return (creating a default empty one if needed) a scheme's mapping pages."""
         if scheme_name not in self.scheme_mappings:
             self.scheme_mappings[scheme_name] = [{
                 'axes': {},
@@ -218,11 +304,13 @@ class OrchestratorNode(Node):
         return self.scheme_mappings[scheme_name]
 
     def get_active_mapping_index_for_scheme(self, scheme_name):
+        """Return (defaulting to 0) the index of the active mapping page."""
         if scheme_name not in self.scheme_active_indices:
             self.scheme_active_indices[scheme_name] = 0
         return self.scheme_active_indices[scheme_name]
 
     def get_active_mapping(self, scheme_name):
+        """Return the currently active mapping-page dict for a scheme."""
         mappings = self.get_mappings_for_scheme(scheme_name)
         idx = self.get_active_mapping_index_for_scheme(scheme_name)
         if idx >= len(mappings):
@@ -231,10 +319,17 @@ class OrchestratorNode(Node):
         return mappings[idx]
 
     def trigger_ui_cycle_update(self):
+        """Ask the mapping window (if open) to reflect a mapping-page cycle."""
         if hasattr(self, 'app') and self.app and self.app.mapping_win:
             GLib.idle_add(self.app.mapping_win.on_mapping_cycled_externally)
-        
+
     def discover_environment(self):
+        """Discovery-timer callback (2s): find Joy input/scheme nodes.
+
+        Scans topics for ``sensor_msgs/msg/Joy`` publishers (input
+        sources) and subscribers (candidate control schemes), spawning
+        background threads to query each candidate's parameters.
+        """
         # 1. Discover Joy Topics
         topic_info = self.get_topic_names_and_types()
         joy_topics = [t[0] for t in topic_info if 'sensor_msgs/msg/Joy' in t[1]]
@@ -248,136 +343,205 @@ class OrchestratorNode(Node):
             # Filter out publishers from this node
             external_pubs = [p for p in pubs if p.node_name != self.get_name() and p.node_name != f"/{self.get_name()}"]
             if external_pubs:
-                if topic not in self.inputs:
+                with self._discovery_lock:
+                    is_new = topic not in self.inputs
+                if is_new:
                     self.add_input_source(topic)
-        
+
         # 3. Discover Control Schemes (Nodes that SUBSCRIBE to Joy)
         for topic in joy_topics:
             subs = self.get_subscriptions_info_by_topic(topic)
             for sub in subs:
                 node_name = sub.node_name
                 if not node_name.startswith('/'): node_name = '/' + node_name
-                
+
                 # Avoid self-discovery
-                if node_name == f"/{self.get_name()}": 
+                if node_name == f"/{self.get_name()}":
                     continue
-                if node_name not in self.control_schemes and node_name not in self.checking_nodes:
-                    self.checking_nodes.add(node_name)
+                with self._discovery_lock:
+                    should_check = node_name not in self.control_schemes and node_name not in self.checking_nodes
+                    if should_check:
+                        self.checking_nodes.add(node_name)
+                if should_check:
                     threading.Thread(target=self.check_if_control_scheme, args=(node_name, topic), daemon=True).start()
 
     def add_input_source(self, topic):
+        """Register a new Joy-publishing topic and subscribe to it.
+
+        Also kicks off a background thread to fetch its axis/button
+        names via ROS parameters.
+        """
         pubs = self.get_publishers_info_by_topic(topic)
         external_pubs = [p for p in pubs if p.node_name != self.get_name() and p.node_name != f"/{self.get_name()}"]
         if not external_pubs: return
         
         self.get_logger().info(f"Adding input source: {topic}")
         node_name = external_pubs[0].node_name
-        
-        self.inputs[topic] = {
-            'axis_names': [],
-            'button_names': [],
-            'last_msg': None,
-            'last_time': None,
-            'node_name': node_name,
-            'sub': self.create_subscription(Joy, topic, lambda msg: self.joy_callback(msg, topic), 1)
-        }
-        
+
+        with self._discovery_lock:
+            self.inputs[topic] = {
+                'axis_names': [],
+                'button_names': [],
+                'last_msg': None,
+                'last_time': None,
+                'node_name': node_name,
+                'sub': self.create_subscription(Joy, topic, lambda msg: self.joy_callback(msg, topic), 1)
+            }
+
         # Fetch names
         if node_name != "unknown":
             threading.Thread(target=self.fetch_source_names, args=(topic, node_name), daemon=True).start()
 
+    def _wait_for_future(self, future, timeout_sec=3.0, poll_interval=0.1):
+        """Poll a service-call future until it's done or ``timeout_sec`` elapses.
+
+        Guards background-thread service calls against an unresponsive
+        service hanging the thread forever (previously only
+        ``wait_for_service`` had a timeout; the ``call_async`` future
+        itself could block indefinitely).
+
+        Returns:
+            True if the future completed before the timeout, else False.
+        """
+        deadline = time.time() + timeout_sec
+        while rclpy.ok() and not future.done():
+            if time.time() >= deadline:
+                return False
+            time.sleep(poll_interval)
+        return future.done()
+
     def fetch_source_names(self, topic, node_name):
+        """Background-thread worker: fetch an input node's axis/button name params.
+
+        Blocks (via polling, bounded by ``_wait_for_future``) on
+        ``list_parameters``/``get_parameters`` service calls; run only
+        off the ROS spin thread. Service clients are always destroyed
+        before returning, even on error or timeout.
+        """
         if not node_name.startswith('/'): node_name = '/' + node_name
-        self.checking_nodes.add(node_name)
+        with self._discovery_lock:
+            self.checking_nodes.add(node_name)
+        list_client = None
+        get_client = None
         try:
             # 1. List parameters first
             list_client = self.create_client(ListParameters, f'{node_name}/list_parameters')
             if not list_client.wait_for_service(timeout_sec=1.0): return
-            
+
             list_req = ListParameters.Request()
             list_req.prefixes = ['axis_names', 'button_names']
             future = list_client.call_async(list_req)
-            while rclpy.ok() and not future.done(): time.sleep(0.1)
-            
-            if future.done():
-                res = future.result()
-                available = res.result.names
-                to_get = [p for p in ['axis_names', 'button_names'] if p in available]
-                
-                if to_get:
-                    get_client = self.create_client(GetParameters, f'{node_name}/get_parameters')
-                    if not get_client.wait_for_service(timeout_sec=1.0): return
-                    get_req = GetParameters.Request()
-                    get_req.names = to_get
-                    future2 = get_client.call_async(get_req)
-                    while rclpy.ok() and not future2.done(): time.sleep(0.1)
-                    
-                    if future2.done():
-                        res2 = future2.result()
-                        for i, name in enumerate(to_get):
-                            if name == 'axis_names':
-                                self.inputs[topic]['axis_names'] = res2.values[i].string_array_value
-                            elif name == 'button_names':
-                                self.inputs[topic]['button_names'] = res2.values[i].string_array_value
+            if not self._wait_for_future(future):
+                self.get_logger().warning(f"Timed out listing parameters from {node_name}")
+                return
+
+            res = future.result()
+            available = res.result.names
+            to_get = [p for p in ['axis_names', 'button_names'] if p in available]
+
+            if to_get:
+                get_client = self.create_client(GetParameters, f'{node_name}/get_parameters')
+                if not get_client.wait_for_service(timeout_sec=1.0): return
+                get_req = GetParameters.Request()
+                get_req.names = to_get
+                future2 = get_client.call_async(get_req)
+                if not self._wait_for_future(future2):
+                    self.get_logger().warning(f"Timed out getting parameters from {node_name}")
+                    return
+
+                res2 = future2.result()
+                with self._discovery_lock:
+                    for i, name in enumerate(to_get):
+                        if name == 'axis_names':
+                            self.inputs[topic]['axis_names'] = res2.values[i].string_array_value
+                        elif name == 'button_names':
+                            self.inputs[topic]['button_names'] = res2.values[i].string_array_value
         except Exception as e:
             self.get_logger().error(f"Error fetching names from {node_name}: {e}")
         finally:
-            self.checking_nodes.discard(node_name)
+            with self._discovery_lock:
+                self.checking_nodes.discard(node_name)
+            if list_client is not None:
+                list_client.destroy()
+            if get_client is not None:
+                get_client.destroy()
 
     def check_if_control_scheme(self, node_name, topic):
+        """Background-thread worker: probe a Joy subscriber for scheme params.
+
+        If ``axis_names``/``button_names`` parameters are found, records
+        it as a control scheme and activates/deactivates it to match
+        ``self.selected_scheme``. Service clients are always destroyed
+        before returning, even on error or timeout.
+        """
         if not node_name.startswith('/'): node_name = '/' + node_name
-        self.checking_nodes.add(node_name)
+        with self._discovery_lock:
+            self.checking_nodes.add(node_name)
+        list_client = None
+        get_client = None
         try:
             list_client = self.create_client(ListParameters, f'{node_name}/list_parameters')
             if not list_client.wait_for_service(timeout_sec=1.0): return
-            
+
             list_req = ListParameters.Request()
             list_req.prefixes = ['axis_names', 'button_names']
             future = list_client.call_async(list_req)
-            while rclpy.ok() and not future.done(): time.sleep(0.1)
-            
-            if future.done():
-                res = future.result()
-                available = res.result.names
-                to_get = [p for p in ['axis_names', 'button_names'] if p in available]
-                
-                if len(to_get) > 0:
-                    get_client = self.create_client(GetParameters, f'{node_name}/get_parameters')
-                    if not get_client.wait_for_service(timeout_sec=1.0): return
-                    get_req = GetParameters.Request()
-                    get_req.names = to_get
-                    future2 = get_client.call_async(get_req)
-                    while rclpy.ok() and not future2.done(): time.sleep(0.1)
-                    
-                    if future2.done():
-                        res2 = future2.result()
-                        scheme_data = {'axis_names': [], 'button_names': []}
-                        for i, name in enumerate(to_get):
-                            scheme_data[name] = res2.values[i].string_array_value
-                        
-                        if scheme_data['axis_names'] or scheme_data['button_names']:
-                            scheme_data['topic'] = topic
-                            self.control_schemes[node_name] = scheme_data
-                            
-                            if node_name == self.selected_scheme:
-                                self.get_logger().info(f"Activating discovered selected scheme: {node_name}")
-                                threading.Thread(target=self.call_scheme_service, args=(node_name, 'activate'), daemon=True).start()
-                            else:
-                                self.get_logger().info(f"Deactivating discovered non-selected scheme: {node_name}")
-                                threading.Thread(target=self.call_scheme_service, args=(node_name, 'deactivate'), daemon=True).start()
+            if not self._wait_for_future(future):
+                self.get_logger().warning(f"Timed out listing parameters from {node_name}")
+                return
+
+            res = future.result()
+            available = res.result.names
+            to_get = [p for p in ['axis_names', 'button_names'] if p in available]
+
+            if len(to_get) > 0:
+                get_client = self.create_client(GetParameters, f'{node_name}/get_parameters')
+                if not get_client.wait_for_service(timeout_sec=1.0): return
+                get_req = GetParameters.Request()
+                get_req.names = to_get
+                future2 = get_client.call_async(get_req)
+                if not self._wait_for_future(future2):
+                    self.get_logger().warning(f"Timed out getting parameters from {node_name}")
+                    return
+
+                res2 = future2.result()
+                scheme_data = {'axis_names': [], 'button_names': []}
+                for i, name in enumerate(to_get):
+                    scheme_data[name] = res2.values[i].string_array_value
+
+                if scheme_data['axis_names'] or scheme_data['button_names']:
+                    scheme_data['topic'] = topic
+                    with self._discovery_lock:
+                        self.control_schemes[node_name] = scheme_data
+                        is_selected = node_name == self.selected_scheme
+
+                    if is_selected:
+                        self.get_logger().info(f"Activating discovered selected scheme: {node_name}")
+                        threading.Thread(target=self.call_scheme_service, args=(node_name, 'activate'), daemon=True).start()
+                    else:
+                        self.get_logger().info(f"Deactivating discovered non-selected scheme: {node_name}")
+                        threading.Thread(target=self.call_scheme_service, args=(node_name, 'deactivate'), daemon=True).start()
         except Exception as e:
             self.get_logger().error(f"Error checking control scheme {node_name}: {e}")
         finally:
-            self.checking_nodes.discard(node_name)
+            with self._discovery_lock:
+                self.checking_nodes.discard(node_name)
+            if list_client is not None:
+                list_client.destroy()
+            if get_client is not None:
+                get_client.destroy()
 
     def joy_callback(self, msg, topic):
-        self.inputs[topic]['last_msg'] = msg
-        self.inputs[topic]['last_time'] = self.get_clock().now()
-        
-        # Update signal pool for this topic
-        axis_names = self.inputs[topic]['axis_names']
-        button_names = self.inputs[topic]['button_names']
-        
+        """Subscription callback: cache a Joy message into the signal pool.
+
+        Keys the pool as ``"{topic}/{axis_or_button_name}"``.
+        """
+        with self._discovery_lock:
+            self.inputs[topic]['last_msg'] = msg
+            self.inputs[topic]['last_time'] = self.get_clock().now()
+            axis_names = self.inputs[topic]['axis_names']
+            button_names = self.inputs[topic]['button_names']
+
         for i, val in enumerate(msg.axes):
             name = axis_names[i] if i < len(axis_names) else f"axis_{i}"
             self.signal_pool[f"{topic}/{name}"] = val
@@ -387,21 +551,33 @@ class OrchestratorNode(Node):
             self.signal_pool[f"{topic}/{name}"] = val
 
     def process_and_publish(self):
+        """Main loop timer callback (30Hz): evaluate constructions and publish.
+
+        Evaluates all ``constructions`` into the signal pool, applies
+        the active mapping's deadband/sensitivity/inversion per output
+        axis, and publishes the resulting Joy to the selected scheme --
+        subject to the throttling options (see the publish gating below).
+        """
         now = time.time()
         # 1. Compute constructions
         if not self.sorted_consts_cache:
             self.sorted_consts_cache = self.get_topological_sort()
-            
+
         for name in self.sorted_consts_cache:
             try:
                 self.signal_pool[name] = self.constructions[name].evaluate(self.signal_pool)
             except Exception as e:
-                pass
+                self.get_logger().error(
+                    f"Error evaluating construction '{name}' (out_type="
+                    f"{self.constructions[name].out_type}): {e}",
+                    throttle_duration_sec=5.0)
             
         # 2. Map to output
-        if not self.selected_scheme or self.selected_scheme not in self.control_schemes:
+        with self._discovery_lock:
+            scheme = self.control_schemes.get(self.selected_scheme) if self.selected_scheme else None
+        if scheme is None:
             return
-            
+
         # Check cycle button first
         cycle_btn = self.scheme_cycle_buttons.get(self.selected_scheme)
         if cycle_btn:
@@ -417,7 +593,6 @@ class OrchestratorNode(Node):
                     self.trigger_ui_cycle_update()
             self.prev_cycle_button_states[self.selected_scheme] = val
 
-        scheme = self.control_schemes[self.selected_scheme]
         active_mapping = self.get_active_mapping(self.selected_scheme)
         out_msg = Joy()
         out_msg.header.stamp = self.get_clock().now().to_msg()
@@ -460,41 +635,78 @@ class OrchestratorNode(Node):
             out_msg.buttons.append(int(self.signal_pool.get(source, 0)) if source else 0)
             
         if self.output_publisher:
-            self.output_publisher.publish(out_msg)
-            self.last_publish_time = now
+            should_publish = True
+            if self.throttling_enabled:
+                min_interval = (1.0 / self.max_rate_hz) if self.max_rate_hz > 0 else 0.0
+                rate_ok = (now - self.last_publish_time) >= min_interval
+                if self.periodic_publish:
+                    # Force a publish at least every min_interval,
+                    # regardless of whether the computed output changed.
+                    should_publish = rate_ok
+                else:
+                    # Only publish when the output actually changed, but
+                    # never faster than max_rate_hz.
+                    changed = (
+                        self._last_published_axes != list(out_msg.axes)
+                        or self._last_published_buttons != list(out_msg.buttons)
+                    )
+                    should_publish = changed and rate_ok
+
+            if should_publish:
+                self.output_publisher.publish(out_msg)
+                self.last_publish_time = now
+                self._last_published_axes = list(out_msg.axes)
+                self._last_published_buttons = list(out_msg.buttons)
 
     def get_topological_sort(self):
-        # Simple Kahn's algorithm or DFS for topo sort
+        """Order constructions so each is evaluated after its dependencies.
+
+        Uses Kahn's algorithm so that a circular dependency only excludes
+        the constructions actually involved in (or depending on) the
+        cycle -- unrelated, non-cyclic constructions are still ordered
+        and evaluated normally. Any excluded constructions are logged.
+
+        Returns:
+            Dependency-sorted construction names. Names involved in a
+            circular dependency are omitted (logged, not evaluated)
+            until the cycle is resolved.
+        """
         nodes = list(self.constructions.keys())
-        adj = {n: self.constructions[n].get_dependencies() for n in nodes}
-        
+        deps = {n: [d for d in self.constructions[n].get_dependencies() if d in self.constructions] for n in nodes}
+
+        # in_degree[n] = number of other constructions n directly depends on.
+        in_degree = {n: len(deps[n]) for n in nodes}
+        # dependents[d] = constructions that list d as a dependency.
+        dependents = {n: [] for n in nodes}
+        for n in nodes:
+            for d in deps[n]:
+                dependents[d].append(n)
+
+        queue = [n for n in nodes if in_degree[n] == 0]
         sorted_nodes = []
-        visited = set()
-        temp_visited = set()
-        
-        def visit(n):
-            if n in temp_visited: raise ValueError("Circular dependency detected")
-            if n not in visited:
-                temp_visited.add(n)
-                deps = adj.get(n, [])
-                for dep in deps:
-                    if dep in self.constructions:
-                        visit(dep)
-                temp_visited.remove(n)
-                visited.add(n)
-                sorted_nodes.append(n)
-        
-        try:
-            for n in nodes:
-                if n not in visited:
-                    visit(n)
-        except ValueError as e:
-            # self.get_logger().error(str(e))
-            return []
-            
+        while queue:
+            n = queue.pop(0)
+            sorted_nodes.append(n)
+            for m in dependents[n]:
+                in_degree[m] -= 1
+                if in_degree[m] == 0:
+                    queue.append(m)
+
+        if len(sorted_nodes) != len(nodes):
+            unresolved = [n for n in nodes if n not in sorted_nodes]
+            self.get_logger().error(
+                f"Circular dependency detected among constructions: {unresolved}. "
+                f"These will not be evaluated until the cycle is resolved."
+            )
+
         return sorted_nodes
 
     def select_scheme(self, scheme_name):
+        """Switch the routed-to control scheme.
+
+        Deactivates the previous scheme, recreates the output publisher
+        on the new scheme's topic, and activates the new scheme.
+        """
         if scheme_name == self.selected_scheme: return
         
         # Deactivate previous scheme if any
@@ -506,8 +718,10 @@ class OrchestratorNode(Node):
         self.selected_scheme = scheme_name
         if self.output_publisher:
             self.destroy_publisher(self.output_publisher)
-        
-        scheme = self.control_schemes.get(scheme_name)
+            self.output_publisher = None
+
+        with self._discovery_lock:
+            scheme = self.control_schemes.get(scheme_name)
         if not scheme: return
         
         topic = scheme['topic']
@@ -519,6 +733,12 @@ class OrchestratorNode(Node):
         threading.Thread(target=self.call_scheme_service, args=(scheme_name, 'activate'), daemon=True).start()
 
     def call_scheme_service(self, scheme_name, action):
+        """Background-thread worker: call a scheme's activate/deactivate Trigger.
+
+        Args:
+            scheme_name: Control scheme node name (service prefix).
+            action: ``'activate'`` or ``'deactivate'``.
+        """
         from std_srvs.srv import Trigger
         srv_name = f"{scheme_name}/{action}"
         try:
@@ -542,6 +762,12 @@ class OrchestratorNode(Node):
 # --- UI Classes ---
 
 class OrchestratorUI(Adw.Application):
+    """Adwaita application shell hosting the orchestrator's GTK windows.
+
+    Owns/tracks the singleton ``MappingWindow``, ``MonitorWindow``, and
+    ``ConstructionManagementWindow`` instances for ``node``.
+    """
+
     def __init__(self, node):
         super().__init__(application_id='com.antigravity.teleop_orchestrator',
                          flags=Gio.ApplicationFlags.FLAGS_NONE)
@@ -552,6 +778,7 @@ class OrchestratorUI(Adw.Application):
         self.const_mgmt_win = None
 
     def do_startup(self):
+        """GTK startup hook: install the monitor-indicator CSS."""
         Adw.Application.do_startup(self)
         # CSS for monitor indicators
         css = """
@@ -567,6 +794,14 @@ class OrchestratorUI(Adw.Application):
         )
 
     def get_all_available_signals(self, signal_type):
+        """List all known signal names of a type, prefixed with ``"None"``.
+
+        Args:
+            signal_type: ``'axis'`` or ``'button'``.
+
+        Returns:
+            ``["None", ...]`` of raw-topic and construction signal names.
+        """
         signals = ["None"]
         # Direct inputs
         # Use list() to avoid RuntimeError if inputs changes during iteration from ROS thread
@@ -587,6 +822,7 @@ class OrchestratorUI(Adw.Application):
         return signals
 
     def refresh_all_windows(self):
+        """Refresh every currently-open child window's displayed data."""
         if self.mapping_win:
             self.mapping_win.refresh_schemes()
         if self.const_mgmt_win:
@@ -595,6 +831,7 @@ class OrchestratorUI(Adw.Application):
             self.monitor_win.refresh_data()
 
     def do_activate(self):
+        """GTK activate hook: open the main mapping window."""
         self.monitor_win = None
         self.const_mgmt_win = None
         
@@ -603,6 +840,12 @@ class OrchestratorUI(Adw.Application):
         self.mapping_win.present()
 
 class MonitorWindow(Gtk.Window):
+    """Live-updating view of all discovered input signals and constructions.
+
+    Polls at 10Hz (``GLib.timeout_add``) to render axis bars/button
+    indicators per source topic and per virtual construction.
+    """
+
     def __init__(self, app, node):
         super().__init__(application=app)
         self.node = node
@@ -629,10 +872,12 @@ class MonitorWindow(Gtk.Window):
         GLib.timeout_add(100, self.refresh_data)
         
     def on_close_request(self, window):
+        """Clear the app's monitor-window reference on close."""
         self.get_application().monitor_win = None
         return False
-        
+
     def refresh_data(self):
+        """Timeout callback: add/update per-topic and construction views."""
         # 1. Update/Add topics
         # Use list() to avoid RuntimeError if inputs changes from ROS thread
         for topic, data in list(self.node.inputs.items()):
@@ -648,6 +893,7 @@ class MonitorWindow(Gtk.Window):
         return True
 
     def add_topic_view(self, topic, data):
+        """Create the GTK frame/widgets for a newly-discovered topic."""
         self.node.get_logger().info(f"Monitor: Adding view for topic {topic}")
         frame = Gtk.Frame(label=f"Source: {topic}")
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
@@ -676,6 +922,7 @@ class MonitorWindow(Gtk.Window):
         }
 
     def update_topic_view(self, topic, data):
+        """Refresh a topic's age label, bars, and button indicators."""
         widgets = self.topic_widgets[topic]
         last_msg = data['last_msg']
         last_time = data['last_time']
@@ -744,6 +991,7 @@ class MonitorWindow(Gtk.Window):
                     widgets['btn_indicators'][i].remove_css_class('monitor-button-on')
 
     def add_constructions_view(self):
+        """Create the GTK frame/widgets for the constructions panel."""
         frame = Gtk.Frame(label="Constructed Inputs")
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         box.set_margin_top(5); box.set_margin_bottom(5); box.set_margin_start(5); box.set_margin_end(5)
@@ -760,6 +1008,7 @@ class MonitorWindow(Gtk.Window):
         }
 
     def update_constructions_view(self):
+        """Refresh each construction's bar/indicator with its current value."""
         widgets = self.topic_widgets["Constructions"]
         for name, const in list(self.node.constructions.items()):
             val = self.node.signal_pool.get(name, 0.0)
@@ -810,6 +1059,8 @@ class MonitorWindow(Gtk.Window):
                 pass
 
 class ConstructionManagementWindow(Gtk.Window):
+    """List/add/edit/delete window for virtual signal ``Construction``s."""
+
     def __init__(self, app, node):
         super().__init__(application=app)
         self.node = node
@@ -837,15 +1088,18 @@ class ConstructionManagementWindow(Gtk.Window):
         self.refresh_list()
         
     def on_close_request(self, window):
+        """Clear the app's construction-management-window reference."""
         self.get_application().const_mgmt_win = None
         return False
-        
+
     def refresh_list(self):
+        """Rebuild the list of construction rows from ``node.constructions``."""
         for child in list(self.const_list): self.const_list.remove(child)
         for name in self.node.constructions:
             self.add_to_const_list(name)
-            
+
     def add_to_const_list(self, name):
+        """Append a row (name + edit/delete buttons) for one construction."""
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         lbl = Gtk.Label(label=name, xalign=0)
         lbl.set_hexpand(True)
@@ -861,10 +1115,12 @@ class ConstructionManagementWindow(Gtk.Window):
         self.const_list.append(row)
 
     def on_edit_const(self, name):
+        """Open the edit dialog for an existing construction."""
         dialog = ConstructionDialog(self, self.node, self.get_application(), edit_name=name)
         dialog.present()
 
     def on_delete_const(self, name):
+        """Delete a construction, refusing if another construction depends on it."""
         for n, c in list(self.node.constructions.items()):
             if name in c.get_dependencies():
                 self.node.get_logger().error(f"Cannot delete {name}, used by {n}")
@@ -874,12 +1130,20 @@ class ConstructionManagementWindow(Gtk.Window):
         self.get_application().refresh_all_windows()
 
     def on_add_const_clicked(self, btn):
+        """Open the add-construction dialog."""
         dialog = ConstructionDialog(self, self.node, self.get_application())
         dialog.present()
 
     def get_all_available_signals(self, signal_type):
+        """Delegate to the application's signal listing (see OrchestratorUI)."""
         return self.get_application().get_all_available_signals(signal_type)
 class MappingWindow(Gtk.Window):
+    """Main window: select scheme, configure cycle button, edit mappings.
+
+    Hosts a notebook of "mapping pages" per scheme, plus save/load of
+    the full routing config to YAML.
+    """
+
     def __init__(self, app, node):
         super().__init__(application=app)
         self.node = node
@@ -949,6 +1213,7 @@ class MappingWindow(Gtk.Window):
         GLib.timeout_add(2000, self.refresh_schemes)
         
     def refresh_schemes(self):
+        """Timeout callback: refresh the scheme dropdown and rebuild on change."""
         schemes = sorted(list(self.node.control_schemes.keys()))
         if schemes != self.last_schemes:
             self.last_schemes = schemes
@@ -966,6 +1231,7 @@ class MappingWindow(Gtk.Window):
         return True
 
     def on_scheme_selected(self, drop, param):
+        """Dropdown callback: switch the active control scheme."""
         selected = drop.get_selected_item()
         if not selected: return
         name = selected.get_string()
@@ -977,6 +1243,7 @@ class MappingWindow(Gtk.Window):
         GLib.idle_add(self.rebuild_notebook_deferred)
 
     def update_cycle_button_dropdown(self):
+        """Repopulate the cycle-button dropdown for the current scheme."""
         if not self.current_scheme_name: return
         # Disconnect signal temporarily
         try:
@@ -996,6 +1263,7 @@ class MappingWindow(Gtk.Window):
         self.cycle_combo.connect("notify::selected-item", self.on_cycle_button_selected)
 
     def on_cycle_button_selected(self, drop, param):
+        """Dropdown callback: set/clear the scheme's mapping-cycle button."""
         if not self.current_scheme_name: return
         item = drop.get_selected_item()
         val = item.get_string() if item else "None"
@@ -1014,10 +1282,12 @@ class MappingWindow(Gtk.Window):
         GLib.idle_add(self.rebuild_notebook_deferred)
 
     def rebuild_notebook_deferred(self):
+        """GLib.idle_add wrapper: rebuild the notebook exactly once."""
         self.rebuild_notebook()
         return False # Ensure only runs once
 
     def rebuild_notebook(self):
+        """Recreate the mapping-page notebook tabs for the current scheme."""
         # Block switch-page callback to prevent recursive triggers and state corruption
         if hasattr(self, 'tab_switch_handler_id') and self.tab_switch_handler_id:
             self.mapping_notebook.handler_block(self.tab_switch_handler_id)
@@ -1073,6 +1343,7 @@ class MappingWindow(Gtk.Window):
             self.mapping_notebook.handler_unblock(self.tab_switch_handler_id)
 
     def on_tab_switched(self, notebook, page, page_num):
+        """Notebook callback: track active page, or create a new one from "+"."""
         if not self.current_scheme_name: return
         mappings = self.node.get_mappings_for_scheme(self.current_scheme_name)
         
@@ -1091,6 +1362,7 @@ class MappingWindow(Gtk.Window):
             self.node.scheme_active_indices[self.current_scheme_name] = page_num
 
     def create_mapping_page_widget(self, scheme, mapping, all_axes, filtered_btns):
+        """Build one mapping page's axis/button rows (dropdown + controls)."""
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_vexpand(True)
         
@@ -1186,6 +1458,7 @@ class MappingWindow(Gtk.Window):
         return scrolled
 
     def on_axis_mapped_in_page(self, out_name, drop, mapping):
+        """Dropdown callback: set/clear an axis's mapped source signal."""
         item = drop.get_selected_item()
         val = item.get_string() if item else "None"
         if val == "None":
@@ -1194,11 +1467,13 @@ class MappingWindow(Gtk.Window):
             mapping['axes'][out_name] = val
 
     def on_axis_inverted_toggled(self, out_name, check_btn, mapping):
+        """Checkbox callback: set an axis's invert flag in the mapping."""
         if 'inverted' not in mapping:
             mapping['inverted'] = {}
         mapping['inverted'][out_name] = check_btn.get_active()
 
     def on_axis_sensitivity_changed(self, out_name, scale, mapping, lbl):
+        """Slider callback: update an axis's sensitivity value + label."""
         val = int(scale.get_value())
         lbl.set_text(f"Sens: {val}")
         if 'sensitivities' not in mapping:
@@ -1206,6 +1481,7 @@ class MappingWindow(Gtk.Window):
         mapping['sensitivities'][out_name] = val
 
     def on_axis_deadband_changed(self, out_name, scale, mapping, lbl):
+        """Slider callback: update an axis's deadband percent + label."""
         val = int(scale.get_value())
         lbl.set_text(f"Dead: {val / 100.0:.2f}")
         if 'deadbands' not in mapping:
@@ -1213,6 +1489,7 @@ class MappingWindow(Gtk.Window):
         mapping['deadbands'][out_name] = val
 
     def on_btn_mapped_in_page(self, out_name, drop, mapping):
+        """Dropdown callback: set/clear a button's mapped source signal."""
         item = drop.get_selected_item()
         val = item.get_string() if item else "None"
         if val == "None":
@@ -1221,6 +1498,7 @@ class MappingWindow(Gtk.Window):
             mapping['buttons'][out_name] = val
 
     def on_delete_tab_clicked(self, idx):
+        """Close-button callback: remove a mapping page (min. one remains)."""
         if not self.current_scheme_name: return
         mappings = self.node.get_mappings_for_scheme(self.current_scheme_name)
         if len(mappings) <= 1: return
@@ -1236,6 +1514,7 @@ class MappingWindow(Gtk.Window):
         GLib.idle_add(self.rebuild_notebook_deferred)
 
     def on_mapping_cycled_externally(self):
+        """Sync the notebook's shown page after a cycle-button press."""
         if not self.current_scheme_name: return False
         active_idx = self.node.get_active_mapping_index_for_scheme(self.current_scheme_name)
         if self.mapping_notebook.get_current_page() != active_idx:
@@ -1247,6 +1526,7 @@ class MappingWindow(Gtk.Window):
         return False
 
     def on_save_clicked(self, btn):
+        """Serialize routing config (options, mappings, constructions) and prompt to save."""
         data = {
             'options': {
                 'throttling_enabled': self.node.throttling_enabled,
@@ -1276,6 +1556,7 @@ class MappingWindow(Gtk.Window):
         file_chooser.save(self, None, self.on_save_file_selected, data)
 
     def on_save_file_selected(self, dialog, result, data):
+        """File-dialog callback: write ``data`` as YAML to the chosen path."""
         try:
             file = dialog.save_finish(result)
             if file:
@@ -1285,10 +1566,12 @@ class MappingWindow(Gtk.Window):
         except: pass
 
     def on_load_clicked(self, btn):
+        """Open the load-config file chooser."""
         file_chooser = Gtk.FileDialog(title="Load Config")
         file_chooser.open(self, None, self.on_load_file_selected)
 
     def on_load_file_selected(self, dialog, result):
+        """File-dialog callback: load YAML and apply it via apply_config."""
         try:
             file = dialog.open_finish(result)
             if file:
@@ -1299,6 +1582,11 @@ class MappingWindow(Gtk.Window):
         except: pass
 
     def apply_config(self, data):
+        """Apply a loaded config dict: constructions, mappings, and options.
+
+        Args:
+            data: Dict as produced by ``on_save_clicked`` / saved YAML.
+        """
         # 1. Load Constructions
         for name, c_data in data.get('constructed_inputs', {}).items():
             if name in self.node.constructions: continue
@@ -1344,20 +1632,24 @@ class MappingWindow(Gtk.Window):
             self.app.const_mgmt_win.refresh_list()
 
     def on_options_clicked(self, btn):
+        """Open the throttling/rate options dialog."""
         dialog = OptionsDialog(self, self.node)
         dialog.present()
 
     def on_monitor_clicked(self, btn):
+        """Open (or focus) the signal monitor window."""
         if not self.app.monitor_win:
             self.app.monitor_win = MonitorWindow(self.app, self.node)
         self.app.monitor_win.present()
 
     def on_const_clicked(self, btn):
+        """Open (or focus) the construction management window."""
         if not self.app.const_mgmt_win:
             self.app.const_mgmt_win = ConstructionManagementWindow(self.app, self.node)
         self.app.const_mgmt_win.present()
 
     def on_close_request(self, window):
+        """Destroy child windows and quit the application."""
         if self.app.monitor_win:
             try:
                 self.app.monitor_win.destroy()
@@ -1372,9 +1664,15 @@ class MappingWindow(Gtk.Window):
         return False
 
     def get_all_available_signals(self, signal_type):
+        """Delegate to the application's signal listing (see OrchestratorUI)."""
         return self.app.get_all_available_signals(signal_type)
 
 class ConstructionDialog(Gtk.Window):
+    """Modal dialog to add a new ``Construction`` or edit an existing one.
+
+    Its parameter fields are rebuilt per-type in ``on_type_changed``.
+    """
+
     def __init__(self, parent, node, app, edit_name=None):
         super().__init__(application=app, transient_for=parent, modal=True)
         self.node = node
@@ -1425,6 +1723,7 @@ class ConstructionDialog(Gtk.Window):
             self.prefill_data()
 
     def prefill_data(self):
+        """Populate the type-specific fields from an existing construction."""
         const = self.node.constructions[self.edit_name]
         t = const.__class__.__name__
         
@@ -1475,6 +1774,7 @@ class ConstructionDialog(Gtk.Window):
             self.node.get_logger().error(f"Error prefilling: {e}")
 
     def on_type_changed(self, drop, param):
+        """Dropdown callback: rebuild the parameter fields for the chosen type."""
         for child in list(self.params_box): self.params_box.remove(child)
         t = self.types[drop.get_selected()]
         
@@ -1566,6 +1866,7 @@ class ConstructionDialog(Gtk.Window):
             self.params_box.append(self.mode)
 
     def on_add_clicked(self, btn):
+        """Build the Construction from field values, checking for cycles."""
         name = self.name_entry.get_text()
         t = self.types[self.type_combo.get_selected()]
         if not name: name = f"{t.lower()}_{len(self.node.constructions)}"
@@ -1611,6 +1912,23 @@ class ConstructionDialog(Gtk.Window):
             self.node.get_logger().error(f"Failed to add construction: {e}")
 
 class OptionsDialog(Gtk.Window):
+    """Modal dialog for throttling/periodic-publish/max-rate options.
+
+    These switches/spinbutton write to ``node`` fields
+    (``throttling_enabled``, ``periodic_publish``, ``max_rate_hz``) read
+    by ``process_and_publish``'s publish-gating logic:
+
+    * ``throttling_enabled`` (off by default): when False, output is
+      published unthrottled on every tick, same as before this option
+      existed.
+    * When enabled, ``max_rate_hz`` bounds how often output is actually
+      published.
+    * ``periodic_publish`` selects *what* happens at that bounded rate:
+      when True, a publish is forced every allowed tick even if the
+      computed output hasn't changed; when False, output is only
+      published when it changed (still no faster than ``max_rate_hz``).
+    """
+
     def __init__(self, parent, node):
         super().__init__(transient_for=parent, modal=True)
         self.node = node
@@ -1645,6 +1963,7 @@ class OptionsDialog(Gtk.Window):
         box.append(save_btn)
         
     def on_apply(self, btn):
+        """Write the dialog's switch/spin values back onto ``node`` and close."""
         self.node.throttling_enabled = self.throttle_sw.get_active()
         self.node.periodic_publish = self.periodic_sw.get_active()
         self.node.max_rate_hz = self.rate_spin.get_value()
@@ -1653,6 +1972,8 @@ class OptionsDialog(Gtk.Window):
 # --- Main Entry ---
 
 def main(args=None):
+    """Entry point: spin the orchestrator node on a background thread,
+    then run the GTK app on the main thread."""
     # CSS for monitor indicators
     css = """
         .monitor-button-off { background-color: #333; border: 1px solid #555; border-radius: 3px; }

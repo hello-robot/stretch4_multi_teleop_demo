@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""StretchCombinedControlNode: 7-axis control scheme combining pitch/lift and yaw/turn.
+
+Two axes drive two joints sequentially (wrist first, then base/lift past a split
+threshold); three buttons freeze subsystems or slow-home the arm/wrist.
+"""
 
 import sys
 import math
@@ -10,7 +15,14 @@ from geometry_msgs.msg import Twist
 from multi_teleop.base import ControlSchemeNode
 
 class StretchCombinedControlNode(ControlSchemeNode):
+    """Combined-axis control scheme: shared axes drive wrist joints, then lift/base.
+
+    "Combined Pitch Lift" moves wrist_pitch until a threshold, then lift; "Combined
+    Yaw Turn" moves wrist_yaw until a threshold, then base rotation.
+    """
+
     def __init__(self):
+        """Declares the 7 axes / 3 buttons, safety limits, and publishers/subscriptions."""
         # 7 Axes as required:
         # 0: Combined Pitch Lift (controls wrist pitch and lift sequentially)
         # 1: Combined Yaw Turn (controls wrist yaw and base theta sequentially)
@@ -51,6 +63,7 @@ class StretchCombinedControlNode(ControlSchemeNode):
         self.declare_parameter("max_joint_vel.wrist_roll", 1.0)
         self.declare_parameter("max_joint_vel.wrist_pitch", 1.0)
         self.declare_parameter("max_joint_vel.wrist_yaw", 1.0)
+        self.declare_parameter("max_joint_vel.gripper", 1.0)
         
         # Split limit degree thresholds (defaults: pitch = 45.0, yaw = 45.0)
         self.declare_parameter("wrist_pitch_split_limit_deg", 45.0)
@@ -67,11 +80,8 @@ class StretchCombinedControlNode(ControlSchemeNode):
         self.declare_parameter("limit.wrist_pitch.upper", 1.047)
         self.declare_parameter("limit.wrist_yaw.lower", -1.047)
         self.declare_parameter("limit.wrist_yaw.upper", 1.047)
-        self.declare_parameter("limit.gripper.lower", 0.0)
-        self.declare_parameter("limit.gripper.upper", 0.15)
-        
+
         # Publishers
-        self.pos_pub = self.create_publisher(JointState, "/joint_position_cmd", 10)
         self.vel_pub = self.create_publisher(JointState, "/joint_velocity_cmd", 10)
         self.base_pub = self.create_publisher(Twist, "/cmd_vel", 10)
         
@@ -97,9 +107,16 @@ class StretchCombinedControlNode(ControlSchemeNode):
         self.get_logger().info("Initialized stretch_combined_control node successfully.")
 
     def joint_states_callback(self, msg: JointState):
+        """Caches the latest /joint_states message for position lookups."""
         self.last_joint_state = msg
 
     def get_joint_position(self, name, default=0.0):
+        """Looks up a joint's last-known position by name, or default if unseen.
+
+        Args:
+            name (str): Joint name to look up.
+            default (float): Value to return if no joint state cached yet or name missing.
+        """
         if self.last_joint_state is None:
             return default
         try:
@@ -146,7 +163,7 @@ class StretchCombinedControlNode(ControlSchemeNode):
             return
             
         params = []
-        for joint in ["lift", "arm", "wrist_roll", "wrist_pitch", "wrist_yaw"]:
+        for joint in ["lift", "arm", "wrist_roll", "wrist_pitch", "wrist_yaw", "stretch_gripper"]:
             p = ParamMsg()
             p.name = f"joint_mode.{joint}"
             p.value = ParameterValue(
@@ -154,16 +171,7 @@ class StretchCombinedControlNode(ControlSchemeNode):
                 string_value="position" if target_is_pos else "velocity"
             )
             params.append(p)
-            
-        # Gripper is always position mode
-        p_grip = ParamMsg()
-        p_grip.name = "joint_mode.stretch_gripper"
-        p_grip.value = ParameterValue(
-            type=ParameterType.PARAMETER_STRING,
-            string_value="position"
-        )
-        params.append(p_grip)
-        
+
         req = SetParameters.Request()
         req.parameters = params
         
@@ -181,12 +189,13 @@ class StretchCombinedControlNode(ControlSchemeNode):
                 
         future.add_done_callback(done_cb)
 
-    def map_range(self, val, joint_name):
-        lower = self.get_parameter(f"limit.{joint_name}.lower").value
-        upper = self.get_parameter(f"limit.{joint_name}.upper").value
-        return (val + 1.0) / 2.0 * (upper - lower) + lower
-
     def handle_joy(self, axes: list, buttons: list):
+        """Publishes base twist and joint velocities from combined-axis Joy input.
+
+        Args:
+            axes (list): 7 axis values (see class docstring for assignment).
+            buttons (list): Up to 3 buttons: freeze-lift-base, freeze-wrist, go-home.
+        """
         if len(axes) < 7:
             self.get_logger().warn(f"Expected at least 7 axes, got {len(axes)}")
             return
@@ -332,28 +341,27 @@ class StretchCombinedControlNode(ControlSchemeNode):
                 vel_cmd[4] = 0.0
                 twist.angular.z = 0.0
 
-        # Arm and Wrist Roll always move normally
-        vel_cmd[1] = float(a_arm * max_arm_vel)
-        vel_cmd[2] = float(-1.0 * a_roll * max_roll_vel)
-        
+            # Arm and Wrist Roll always move normally in this mode. Kept inside the
+            # normal-mode branch so hold_to_go_home's P-control homing values (and any
+            # future freeze-mode overrides) aren't clobbered afterward.
+            vel_cmd[1] = float(a_arm * max_arm_vel)
+            vel_cmd[2] = float(-1.0 * a_roll * max_roll_vel)
+
+        max_grip_vel = self.get_parameter("max_joint_vel.gripper").value
+        grip_vel = float(a_grip * max_grip_vel)
+
         # Publish Twist (base command)
         self.base_pub.publish(twist)
-        
-        # Publish Joint Velocities
+
+        # Publish Joint Velocities (including gripper)
         vel_msg = JointState()
         vel_msg.header.stamp = self.get_clock().now().to_msg()
-        vel_msg.name = ["lift", "arm", "wrist_roll", "wrist_pitch", "wrist_yaw"]
-        vel_msg.velocity = vel_cmd
+        vel_msg.name = ["lift", "arm", "wrist_roll", "wrist_pitch", "wrist_yaw", "stretch_gripper"]
+        vel_msg.velocity = vel_cmd + [grip_vel]
         self.vel_pub.publish(vel_msg)
-        
-        # Publish Gripper Position (always position controlled)
-        pos_msg = JointState()
-        pos_msg.header.stamp = self.get_clock().now().to_msg()
-        pos_msg.name = ["stretch_gripper"]
-        pos_msg.position = [self.map_range(a_grip, "gripper")]
-        self.pos_pub.publish(pos_msg)
 
 def main(args=None):
+    """Entry point: initializes rclpy and spins a StretchCombinedControlNode."""
     rclpy.init(args=args)
     node = StretchCombinedControlNode()
     try:

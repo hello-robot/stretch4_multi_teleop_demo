@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""SimDirectPositionControlNode: talks directly to the MuJoCo sim (bypasses the ROS driver).
+
+Registered console-script name is "sim_direct_position_control", matching the
+class/node name and this module's own name -- this preserves the naming
+distinction from a planned (not yet built) node that will drive the real
+robot directly, bypassing the ROS driver.
+"""
 
 import rclpy
 from multi_teleop.base import ControlSchemeNode
@@ -11,8 +18,15 @@ import numpy as np
 import threading
 import time
 
-class DirectPositionControlNode(ControlSchemeNode):
+class SimDirectPositionControlNode(ControlSchemeNode):
+    """Direct position/velocity control scheme driving a MuJoCo Stretch4MujocoSimulator.
+
+    Axes set joint position targets directly; buttons set base translation/rotation
+    velocity targets. Publishes nothing -- commands go straight to the sim object.
+    """
+
     def __init__(self):
+        """Configures joint ranges/axis mapping and starts the sim + 20Hz command timer."""
         # Head Pan and Head Tilt are not available in this Stretch 4 MJCF model
         self.axis_names = [
             "Lift", "Arm", "Wrist Yaw", "Wrist Pitch", "Wrist Roll", "Gripper"
@@ -20,7 +34,7 @@ class DirectPositionControlNode(ControlSchemeNode):
         self.button_names = [
             "Forward", "Backward", "Left", "Right", "rotate_cw", "rotate_ccw"
         ]
-        super().__init__("direct_position_control", self.axis_names, self.button_names)
+        super().__init__("sim_direct_position_control", self.axis_names, self.button_names)
         
         # Joint ranges
         self.ranges = {
@@ -57,6 +71,12 @@ class DirectPositionControlNode(ControlSchemeNode):
         self.get_logger().info("Direct Position Control Node Initialized with 20Hz command loop.")
 
     def handle_joy(self, axes: list, buttons: list):
+        """Updates target joint positions and base velocity targets from Joy input.
+
+        Args:
+            axes (list): 6 joint position axes (lift, arm, wrist yaw/pitch/roll, gripper).
+            buttons (list): 6 directional buttons (forward/back/left/right/rotate cw/ccw).
+        """
         # Safety check for message size
         if len(axes) != len(self.axis_names) or len(buttons) != len(self.button_names):
             self.get_logger().warning(
@@ -127,6 +147,10 @@ class DirectPositionControlNode(ControlSchemeNode):
         self.prev_buttons = list(buttons)
 
     def command_loop(self):
+        """20Hz timer callback: sends target joint positions/base velocity to the sim.
+
+        Zeroes base velocity targets if no Joy message has arrived in 0.5s (watchdog).
+        """
         if not self.sim.is_running():
             return
 
@@ -157,8 +181,9 @@ class DirectPositionControlNode(ControlSchemeNode):
             self.last_sent_omega = self.target_omega
 
 def main(args=None):
+    """Entry point: spins a SimDirectPositionControlNode and runs the sim on the main thread."""
     rclpy.init(args=args)
-    node = DirectPositionControlNode()
+    node = SimDirectPositionControlNode()
     
     # Start ROS spin in a separate thread
     ros_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)

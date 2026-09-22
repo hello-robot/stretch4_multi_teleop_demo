@@ -97,9 +97,13 @@ The orchestrator maps input sources to control scheme fields on an output-by-out
 ### C. Virtual Signal Constructions
 For advanced mappings, the orchestrator allows constructing virtual signals:
 *   `AxisToButton`: Fires a button press when an axis crosses a threshold.
+*   `ButtonToAxis`: Maps a button (0/1) to a configurable axis low/high value pair.
 *   `TwoButtonsToAxis`: Combines two discrete buttons (e.g., Up/Down) into a single analog axis (range `-1.0` to `1.0`).
 *   `DeadbandAxis`: Ignores small analog drifts around the origin.
-*   `LogicalButton`: Creates Boolean logic gates (AND, OR, NOT) on buttons.
+*   `LogicalButton`: Creates Boolean logic gates (AND, OR, NAND, NOR, NOT) on buttons.
+*   `AxisOverride`: Passes a secondary axis through while the primary is near-zero.
+*   `ButtonOverride`: Passes a secondary button through only while a priority button is 0.
+*   `AxisButtonControl`: Gates an axis by a button (START/STOP-when-pressed, or TOGGLE).
 *   `AverageAxis` / `InvertAxis` / `SquareAxis` / `SqrtAxis`: Mathematic filters.
 
 ---
@@ -222,7 +226,7 @@ ros2 param get /teleop_orchestrator selected_scheme
     ```
 4.  **Launch Orchestrator GUI**:
     ```bash
-    ros2 run multi_teleop teleop_orchestrator
+    ros2 run multi_teleop orchestrator
     ```
 5.  **Enable Your Preferred Scheme**:
     Set the mapping via the GUI or service client:

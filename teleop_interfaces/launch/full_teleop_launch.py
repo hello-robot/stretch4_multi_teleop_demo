@@ -1,12 +1,18 @@
+"""Launches all teleop_interfaces input nodes.
+
+Nodes: includes cam_trackers_launch.py (camera + MediaPipe trackers), plus
+space_mouse_node, mouse_node, gamepad_node, voice_node, gui_node. Does not
+launch interface_monitor (run separately for debugging).
+"""
 from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
-import os
 
 def generate_launch_description():
+    """Build the full teleop_interfaces launch description."""
     # --- Models and Configs ---
     model_dir_arg = DeclareLaunchArgument(
         'model_dir',
@@ -32,7 +38,7 @@ def generate_launch_description():
         DeclareLaunchArgument('image_topic', default_value='/image_raw'),
         DeclareLaunchArgument('voice_model_size', default_value='base.en'),
 
-        # 0. Camera and Vision Trackers (included from cam_trackers_launch.py)
+        # 1. Camera and Vision Trackers (included from cam_trackers_launch.py)
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 PathJoinSubstitution([pkg_share, 'launch', 'cam_trackers_launch.py'])

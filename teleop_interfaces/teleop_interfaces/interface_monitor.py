@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""GTK4/Adwaita debug GUI that discovers and visualizes all live sensor_msgs/Joy topics."""
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Joy
@@ -11,13 +12,17 @@ gi.require_version('Adw', '1')
 from gi.repository import Gtk, Gio, GLib, Adw
 
 class InterfaceMonitor(Adw.Application):
+    """Scans the ROS graph for Joy topics and renders a live axes/buttons panel each."""
+
     def __init__(self, node):
+        """Store the plain rclpy Node used for topic discovery and subscriptions."""
         super().__init__(application_id='com.antigravity.interface_monitor',
                          flags=Gio.ApplicationFlags.FLAGS_NONE)
         self.node = node
         self.topic_data = {}  # topic_name -> {box, sub, axes_widgets, button_widgets, axis_labels, button_labels}
-        
+
     def do_activate(self):
+        """GTK activation hook: build the window and trigger an initial topic scan."""
         self.win = Adw.ApplicationWindow(application=self)
         self.win.set_title("Antigravity Interface Monitor")
         self.win.set_default_size(800, 600)
@@ -52,9 +57,11 @@ class InterfaceMonitor(Adw.Application):
         GLib.idle_add(self.rescan_environment)
 
     def on_rescan_clicked(self, button):
+        """Button callback: re-run the topic scan."""
         self.rescan_environment()
 
     def rescan_environment(self):
+        """Find all sensor_msgs/Joy topics and add/remove monitor cards to match."""
         self.node.get_logger().info("Scanning for Joy topics...")
         topic_names_and_types = self.node.get_topic_names_and_types()
         
@@ -75,6 +82,7 @@ class InterfaceMonitor(Adw.Application):
                 self._add_topic_monitor(topic)
 
     def _add_topic_monitor(self, topic):
+        """Create a card + subscription for a newly discovered Joy topic."""
         self.node.get_logger().info(f"Adding monitor for: {topic}")
         
         card = Gtk.Frame()
@@ -124,6 +132,7 @@ class InterfaceMonitor(Adw.Application):
         self.topic_data[topic]['sub'] = sub
 
     def _fetch_params(self, topic, node_name):
+        """Background-thread: fetch axis_names/button_names from the publishing node."""
         from rcl_interfaces.srv import GetParameters
         client = self.node.create_client(GetParameters, f'{node_name}/get_parameters')
         
@@ -149,6 +158,7 @@ class InterfaceMonitor(Adw.Application):
             time.sleep(0.1)
 
     def _update_labels(self, topic, axis_names, button_names):
+        """Apply fetched axis/button names to the card's labels, if it still exists."""
         if topic not in self.topic_data: return
         data = self.topic_data[topic]
         
@@ -161,6 +171,7 @@ class InterfaceMonitor(Adw.Application):
                 data['button_labels'][i].set_text(name)
 
     def _joy_callback(self, msg, topic):
+        """Subscription callback (marshaled via GLib.idle_add): update the topic's widgets."""
         if topic not in self.topic_data:
             return
             
@@ -184,6 +195,7 @@ class InterfaceMonitor(Adw.Application):
                     data['button_widgets'][i].remove_css_class('suggested-action')
 
     def _init_widgets(self, topic, num_axes, num_buttons):
+        """Lazily build the axis sliders and button indicators for a topic's card."""
         data = self.topic_data[topic]
         
         # CSS for buttons
@@ -238,6 +250,7 @@ class InterfaceMonitor(Adw.Application):
             grid.append(btn_box)
 
 def main(args=None):
+    """Entry point: spin a plain Node on a thread and run the InterfaceMonitor GTK app."""
     rclpy.init(args=args)
     node = Node('interface_monitor_node')
     

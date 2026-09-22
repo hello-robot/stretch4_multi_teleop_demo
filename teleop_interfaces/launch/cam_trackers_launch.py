@@ -1,3 +1,8 @@
+"""Launches the camera + MediaPipe tracker nodes.
+
+Nodes: usb_cam (image_raw publisher), head_face_tracker, hands_tracker
+(both hands), hand_tracker (single hand, right by default).
+"""
 from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument
@@ -5,6 +10,7 @@ from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
+    """Build the camera + MediaPipe tracker launch description."""
     # --- Models and Configs ---
     model_dir_arg = DeclareLaunchArgument(
         'model_dir',

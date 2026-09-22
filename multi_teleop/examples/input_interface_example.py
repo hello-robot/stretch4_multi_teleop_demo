@@ -1,3 +1,4 @@
+"""Minimal tutorial reference for writing a new InputInterfaceNode subclass."""
 import rclpy
 from multi_teleop.base import InputInterfaceNode
 from sensor_msgs.msg import Joy
@@ -5,6 +6,9 @@ from pynput import keyboard
 import threading
 
 class KeyboardInputInterface(InputInterfaceNode):
+    """Tutorial input interface: arrow keys accumulate two axes [0,1];
+    w/a/s/d are momentary buttons."""
+
     def __init__(self):
         # Pass axis and button names to the super constructor
         # This will declare them as read-only ROS parameters
@@ -31,16 +35,18 @@ class KeyboardInputInterface(InputInterfaceNode):
         self.get_logger().info(f"KeyboardInputInterface initialized. Axes: {self.control_axes}, Buttons: {self.control_buttons}")
 
     def _on_press(self, key):
+        """pynput callback: record a pressed key and set its button if tracked."""
         try:
             k = key.char
         except AttributeError:
             k = str(key)
         self.pressed_keys.add(k)
-        
+
         if k in self.button_states:
             self.button_states[k] = 1
 
     def _on_release(self, key):
+        """pynput callback: forget a released key and clear its button if tracked."""
         try:
             k = key.char
         except AttributeError:
@@ -53,6 +59,7 @@ class KeyboardInputInterface(InputInterfaceNode):
             self.button_states[k] = 0
 
     def update_and_publish(self):
+        """Timer callback (20Hz): integrate arrow-key axes and publish_input."""
         # Update axes based on held keys
         # "holding down left decreases the value in left-right, and holding right increases it"
         # "down decreases, up increases"
@@ -76,6 +83,7 @@ class KeyboardInputInterface(InputInterfaceNode):
         self.publish_input(axes, buttons)
 
 def main(args=None):
+    """Entry point: spin a KeyboardInputInterface node until interrupted."""
     rclpy.init(args=args)
     node = KeyboardInputInterface()
     try:

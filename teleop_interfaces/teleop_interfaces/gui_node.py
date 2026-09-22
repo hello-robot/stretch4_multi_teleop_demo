@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""GTK4/Adwaita on-screen teleop GUI: config-driven sliders/buttons published as Joy."""
 import rclpy
 from multi_teleop.base import InputInterfaceNode
 import gi
@@ -11,12 +12,16 @@ gi.require_version('Adw', '1')
 from gi.repository import Gtk, Gio, GLib, Adw
 
 class TeleopGuiApp(Adw.Application):
+    """GTK application that builds sliders/buttons from GuiNode's config and drives it."""
+
     def __init__(self, node):
+        """Store the GuiNode this app's widgets will read/update."""
         super().__init__(application_id='com.antigravity.teleop_gui',
                          flags=Gio.ApplicationFlags.FLAGS_NONE)
         self.node = node
-        
+
     def do_activate(self):
+        """GTK activation hook: build and present the main window from node config."""
         self.win = Adw.ApplicationWindow(application=self)
         self.win.set_title("Antigravity Teleop Dashboard")
         self.win.set_default_size(500, 400)
@@ -93,23 +98,30 @@ class TeleopGuiApp(Adw.Application):
         self.win.present()
 
     def _on_axis_change(self, scale, idx):
+        """Slider callback: write the new axis value and publish immediately."""
         self.node._axes_values[idx] = scale.get_value()
         self.node.update_and_publish()
 
     def _on_button_toggle(self, btn, idx):
+        """Toggle-button callback: write the new button state and publish immediately."""
         self.node._buttons_values[idx] = 1 if btn.get_active() else 0
         self.node.update_and_publish()
 
     def _on_button_press(self, gesture, n_press, x, y, idx):
+        """Momentary-button press callback: set button to 1 and publish."""
         self.node._buttons_values[idx] = 1
         self.node.update_and_publish()
 
     def _on_button_release(self, gesture, n_press, x, y, idx):
+        """Momentary-button release callback: set button to 0 and publish."""
         self.node._buttons_values[idx] = 0
         self.node.update_and_publish()
 
 class GuiNode(InputInterfaceNode):
+    """InputInterfaceNode driven by TeleopGuiApp's widgets instead of a hardware device."""
+
     def __init__(self, config_path=None):
+        """Load axis/button config (or fall back to one dummy axis/button) and init state."""
         # 1. Load config
         self._axis_configs = []
         self._button_configs = []
@@ -134,9 +146,11 @@ class GuiNode(InputInterfaceNode):
         self._buttons_values = [0] * len(button_names)
 
     def update_and_publish(self):
+        """Publish the current slider/button widget state as Joy."""
         self.publish_input(self._axes_values, self._buttons_values)
 
 def main(args=None):
+    """Entry point: parse --config, spin GuiNode on a thread, and run the GTK app."""
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--config', help='Path to config file')

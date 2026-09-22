@@ -28,7 +28,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'direct_position_control = control_schemes.direct_position_control:main',
+            'sim_direct_position_control = control_schemes.sim_position_control:main',
             'stretch_position_control = control_schemes.stretch_control_node:main_position',
             'stretch_velocity_control = control_schemes.stretch_control_node:main_velocity',
             'stretch_mixed_control = control_schemes.stretch_control_node:main_mixed',

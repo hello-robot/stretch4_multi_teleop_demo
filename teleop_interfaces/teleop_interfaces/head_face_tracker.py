@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Face MediaPipe tracker: publishes nose position + rough head pose as a 6DOF Joy signal."""
 import rclpy
 from teleop_interfaces.mediapipe_base import MediaPipeBaseNode
 import mediapipe as mp
@@ -8,7 +9,10 @@ import numpy as np
 import cv2
 
 class HeadFaceTracker(MediaPipeBaseNode):
+    """Tracks a single face via MediaPipe FaceLandmarker (478 landmarks)."""
+
     def __init__(self, config_path):
+        """Set up the 478 face landmark point names and, if model_path is set, the detector."""
         self._point_names = [f"pt_{i}" for i in range(478)]
         super().__init__('head_face_tracker', config_path)
         
@@ -22,6 +26,15 @@ class HeadFaceTracker(MediaPipeBaseNode):
         self.detector = vision.FaceLandmarker.create_from_options(options)
 
     def process_frame(self, frame):
+        """Detect a face and derive an approximate 6DOF pose from key landmarks.
+
+        Returns:
+            [x, y, z, roll, pitch, yaw] from the nose landmark, or None if no
+            face is detected. roll, pitch, and yaw are all arctan2 angles in
+            radians, each derived the same way: the depth (z) difference
+            between two landmarks spanning a face axis, over the in-plane
+            distance along that same axis.
+        """
         if not hasattr(self, 'detector'):
             return None
             
@@ -63,9 +76,14 @@ class HeadFaceTracker(MediaPipeBaseNode):
         dx = re.x - le.x
         dy = re.y - le.y
         roll = np.arctan2(dy, dx)
-        
-        yaw = (nose.x - (le.x + re.x)/2.0) / (re.x - le.x + 1e-6)
-        
+
+        # Yaw: same style as pitch below - the depth (z) difference between
+        # the two eye-outer-corner landmarks (left/right head turn moves one
+        # eye closer to the camera than the other), over the in-plane
+        # horizontal distance between them (dx, already computed for roll).
+        dz_eyes = re.z - le.z
+        yaw = np.arctan2(dz_eyes, dx)
+
         top = face_landmarks[10]
         chin = face_landmarks[152]
         dy = chin.y - top.y
@@ -75,6 +93,7 @@ class HeadFaceTracker(MediaPipeBaseNode):
         return [x, y, z, roll, pitch, yaw]
 
 def main(args=None):
+    """Entry point: parse --config, construct HeadFaceTracker, and spin until interrupted."""
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--config', help='Path to config file')

@@ -1,3 +1,8 @@
+"""Launches direct position control, the space mouse, and the hand tracker.
+
+Note: ``sim_direct_position_control`` is launched here; the orchestrator
+itself is not launched here.
+"""
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -20,8 +25,8 @@ def generate_launch_description():
         # Direct Position Control Node (Simulator + ROS Interface)
         Node(
             package='control_schemes',
-            executable='direct_position_control',
-            name='direct_position_control',
+            executable='sim_direct_position_control',
+            name='sim_direct_position_control',
             output='screen'
         ),
         

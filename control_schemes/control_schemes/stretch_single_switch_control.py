@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""StretchSingleSwitchControlNode: single-switch scanning control for accessibility.
+
+One button cycles a 5-state machine (stopped/pan/tilt/translate-oscillate/move)
+at a fixed 20Hz timer; each press advances the state, selecting the next motion.
+"""
 
 import sys
 import numpy as np
@@ -14,7 +19,14 @@ from stretch4_kinematics.state import StretchJointPositions, StretchJointVelocit
 from stretch4_kinematics.kinematic_models import ToolFrameKinematics
 
 class StretchSingleSwitchControlNode(ControlSchemeNode):
+    """Single-button scanning control: press cycles pan/tilt/translate/move states.
+
+    States: 0 Stopped, 1 Panning (wrist_yaw), 2 Tilting (wrist_pitch),
+    3 Translating (oscillating), 4 Moving (continuous, in captured direction).
+    """
+
     def __init__(self):
+        """Declares exploration/limit/velocity parameters and starts the 20Hz control timer."""
         # 0 Axes, 1 Switch Button
         self.axis_names = []
         self.button_names = ["Switch Button"]
@@ -83,6 +95,7 @@ class StretchSingleSwitchControlNode(ControlSchemeNode):
         self.get_logger().info(f"Initialized {node_name} (Single Switch Assistive Controller). State: 0 (Stopped)")
 
     def joint_states_callback(self, msg: JointState):
+        """Caches the latest /joint_states message for position lookups."""
         self.last_joint_state = msg
 
     def discover_driver_node(self):
@@ -158,6 +171,7 @@ class StretchSingleSwitchControlNode(ControlSchemeNode):
         future.add_done_callback(done_cb)
 
     def parse_joint_positions(self) -> StretchJointPositions:
+        """Builds a StretchJointPositions from the last /joint_states message, or None."""
         if self.last_joint_state is None:
             return None
             
@@ -189,9 +203,15 @@ class StretchSingleSwitchControlNode(ControlSchemeNode):
         )
 
     def handle_joy(self, axes: list, buttons: list):
+        """Advances the state machine on a rising edge of the switch button.
+
+        Args:
+            axes (list): Unused (this scheme has no axes).
+            buttons (list): Single switch button; a 0->1 transition triggers advance.
+        """
         if len(buttons) < 1:
             return
-            
+
         # Detect rising edge of the switch button
         button_val = buttons[0]
         if button_val == 1 and not self._last_button_state:
@@ -201,6 +221,7 @@ class StretchSingleSwitchControlNode(ControlSchemeNode):
             self._last_button_state = False
 
     def transition_state(self):
+        """Advances to the next state (wrapping 4 -> 0) and resets per-state timing/direction."""
         # Cycle through states: 0 -> 1 -> 2 -> 3 -> 4 -> 0
         prev_state = self._state
         self._state = (self._state + 1) % 5
@@ -264,6 +285,7 @@ class StretchSingleSwitchControlNode(ControlSchemeNode):
             # STOPPED
             self.base_pub.publish(twist)
             self.vel_pub.publish(vel_msg)
+            self.pos_pub.publish(pos_msg)  # still recenter the gripper while stopped
             return
             
         elif self._state == 1:
@@ -391,6 +413,7 @@ class StretchSingleSwitchControlNode(ControlSchemeNode):
         self.pos_pub.publish(pos_msg)
 
 def main(args=None):
+    """Entry point: initializes rclpy and spins a StretchSingleSwitchControlNode."""
     rclpy.init(args=args)
     node = StretchSingleSwitchControlNode()
     try:

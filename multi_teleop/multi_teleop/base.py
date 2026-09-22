@@ -1,3 +1,11 @@
+"""Shared base classes for the multi_teleop input/control-scheme pipeline.
+
+Defines ``ControlSchemeNode`` and ``InputInterfaceNode``, the abstract
+base classes that every input device node and control scheme node in
+``teleop_interfaces`` and ``control_schemes`` subclasses. Both exchange
+``sensor_msgs/msg/Joy`` messages over ``/{node_name}/output`` (interfaces)
+and ``/{node_name}/input`` (schemes).
+"""
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Joy
@@ -6,30 +14,37 @@ from abc import ABC, abstractmethod
 from std_srvs.srv import Trigger
 
 class ControlSchemeNode(Node, ABC):
+    """Base class for nodes that consume routed teleop commands.
+
+    Registers ``/{node_name}/activate`` and ``/{node_name}/deactivate``
+    ``std_srvs/srv/Trigger`` services, and silences all of this node's
+    publishers while inactive (see ``create_publisher`` override below).
+    Subscribes to ``/{node_name}/input`` (``sensor_msgs/msg/Joy``) and
+    dispatches validated axes/buttons to the abstract ``handle_joy``.
+    """
+
     def __init__(self, node_name, axis_names, button_names, **kwargs):
+        """Register activation services, input subscriber, and name params.
+
+        Args:
+            node_name: ROS node name; also used as the service/topic prefix.
+            axis_names: Ordered list of expected control axis names.
+            button_names: Ordered list of expected control button names.
+        """
+        # Set before super().__init__() so that create_publisher's
+        # activation-silencing wrapper (below) has self.active available
+        # even for publishers Node.__init__() itself creates internally
+        # (e.g. the parameter-event publisher).
+        self.active = True  # Active by default for standalone/backward-compatibility
+
         super().__init__(node_name, **kwargs)
         self._axes = axis_names
         self._buttons = button_names
-        
-        self.active = True  # Active by default for standalone/backward-compatibility
-        
+
         # Services to activate/deactivate
         self.create_service(Trigger, f'{node_name}/activate', self._activate_callback)
         self.create_service(Trigger, f'{node_name}/deactivate', self._deactivate_callback)
-        
-        # Wrap create_publisher to silence child class publishers when inactive
-        self_create_pub = super().create_publisher
-        def wrapped_create_publisher(msg_type, topic, qos_profile, **kwargs):
-            pub = self_create_pub(msg_type, topic, qos_profile, **kwargs)
-            original_publish = pub.publish
-            def wrapped_publish(msg):
-                if not self.active:
-                    return  # Ignore/Silence if inactive
-                return original_publish(msg)
-            pub.publish = wrapped_publish
-            return pub
-        self.create_publisher = wrapped_create_publisher
-        
+
         # Declare read-only parameters for names in initialization
         self.declare_parameter(
             'axis_names', 
@@ -50,7 +65,26 @@ class ControlSchemeNode(Node, ABC):
             1
         )
 
+    def create_publisher(self, msg_type, topic, qos_profile, **kwargs):
+        """Override ``Node.create_publisher``: silence publishing while inactive.
+
+        A real method override (rather than an instance-level monkey-patch)
+        so a base-class ``Node.create_publisher(self, ...)`` call can't
+        bypass the silencing wrapper below. Wraps the created
+        ``Publisher``'s ``publish`` so calls are dropped whenever
+        ``self.active`` is False.
+        """
+        pub = super().create_publisher(msg_type, topic, qos_profile, **kwargs)
+        original_publish = pub.publish
+        def wrapped_publish(msg):
+            if not self.active:
+                return  # Ignore/Silence if inactive
+            return original_publish(msg)
+        pub.publish = wrapped_publish
+        return pub
+
     def _activate_callback(self, request, response):
+        """Trigger service handler: mark this scheme active."""
         self.active = True
         response.success = True
         response.message = f"Control scheme {self.get_name()} activated."
@@ -58,6 +92,7 @@ class ControlSchemeNode(Node, ABC):
         return response
 
     def _deactivate_callback(self, request, response):
+        """Trigger service handler: mark this scheme inactive."""
         self.active = False
         response.success = True
         response.message = f"Control scheme {self.get_name()} deactivated."
@@ -75,6 +110,7 @@ class ControlSchemeNode(Node, ABC):
         return self._buttons
 
     def _joy_callback(self, msg: Joy):
+        """Validate/pad incoming Joy axes+buttons, then call handle_joy."""
         if not self.active:
             return
         # Check if length matching with the names
@@ -82,7 +118,9 @@ class ControlSchemeNode(Node, ABC):
         buttons_len = len(self.control_buttons)
 
         if len(msg.axes) != axes_len:
-            self.get_logger().warn(f"Received Joy message with {len(msg.axes)} axes, but expected {axes_len}")
+            self.get_logger().warn(
+                f"Received Joy message with {len(msg.axes)} axes, but expected {axes_len}",
+                throttle_duration_sec=5.0)
             axes = list(msg.axes)
             if len(axes) < axes_len:
                 axes.extend([0.0] * (axes_len - len(axes)))
@@ -92,7 +130,9 @@ class ControlSchemeNode(Node, ABC):
             axes = list(msg.axes)
 
         if len(msg.buttons) != buttons_len:
-            self.get_logger().warn(f"Received Joy message with {len(msg.buttons)} buttons, but expected {buttons_len}")
+            self.get_logger().warn(
+                f"Received Joy message with {len(msg.buttons)} buttons, but expected {buttons_len}",
+                throttle_duration_sec=5.0)
             buttons = list(msg.buttons)
             if len(buttons) < buttons_len:
                 buttons.extend([0] * (buttons_len - len(buttons)))
@@ -109,7 +149,21 @@ class ControlSchemeNode(Node, ABC):
         pass
 
 class InputInterfaceNode(Node, ABC):
+    """Base class for nodes that expose a physical/virtual input device.
+
+    Tracks the device's last-known axes/buttons and publishes
+    ``sensor_msgs/msg/Joy`` to ``/{node_name}/output`` via
+    ``publish_input``.
+    """
+
     def __init__(self, node_name, axis_names, button_names, **kwargs):
+        """Set up device state, name params, and the output publisher.
+
+        Args:
+            node_name: ROS node name; also used as the output topic prefix.
+            axis_names: Ordered list of this device's axis names.
+            button_names: Ordered list of this device's button names.
+        """
         super().__init__(node_name, **kwargs)
         self._axes = axis_names
         self._buttons = button_names
