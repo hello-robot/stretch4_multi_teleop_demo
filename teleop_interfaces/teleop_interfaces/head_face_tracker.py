@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Face MediaPipe tracker: publishes nose position + rough head pose as a 6DOF Joy signal."""
 import rclpy
-from teleop_interfaces.mediapipe_base import MediaPipeBaseNode
+from teleop_interfaces.mediapipe_base import MediaPipeBaseNode, aspect_corrected
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -11,10 +11,10 @@ import cv2
 class HeadFaceTracker(MediaPipeBaseNode):
     """Tracks a single face via MediaPipe FaceLandmarker (478 landmarks)."""
 
-    def __init__(self, config_path):
+    def __init__(self, config_path, node_name='head_face_tracker'):
         """Set up the 478 face landmark point names and, if model_path is set, the detector."""
         self._point_names = [f"pt_{i}" for i in range(478)]
-        super().__init__('head_face_tracker', config_path)
+        super().__init__(node_name, config_path)
         
         if not self.model_path:
             return
@@ -29,8 +29,10 @@ class HeadFaceTracker(MediaPipeBaseNode):
         """Detect a face and derive an approximate 6DOF pose from key landmarks.
 
         Returns:
-            [x, y, z, roll, pitch, yaw] from the nose landmark, or None if no
-            face is detected. roll, pitch, and yaw are all arctan2 angles in
+            [x, y, z, roll, pitch, yaw], or None if no face is detected. x/y
+            are the nose landmark; z is 1 / the distance between the outer eye
+            corners (grows as the face moves away - MediaPipe's own face z is
+            relative to the head, so it can't measure distance). roll, pitch, and yaw are all arctan2 angles in
             radians, each derived the same way: the depth (z) difference
             between two landmarks spanning a face axis, over the in-plane
             distance along that same axis.
@@ -68,11 +70,18 @@ class HeadFaceTracker(MediaPipeBaseNode):
                 self._landmarks[friendly_map[i]] = coords
             
         # Estimate 6DOF
+        h, w = frame.shape[:2]
+        aspect = h / w
+
         nose = face_landmarks[1]
-        x, y, z = nose.x, nose.y, nose.z
-        
+        x, y = nose.x, nose.y
+
         le = face_landmarks[33]
         re = face_landmarks[263]
+        eye_dist = np.linalg.norm((aspect_corrected([re.x, re.y, re.z], aspect)
+                                   - aspect_corrected([le.x, le.y, le.z], aspect))[:2])
+        z = 1.0 / max(eye_dist, 1e-6)
+
         dx = re.x - le.x
         dy = re.y - le.y
         roll = np.arctan2(dy, dx)
@@ -90,7 +99,7 @@ class HeadFaceTracker(MediaPipeBaseNode):
         dz = top.z - chin.z
         pitch = np.arctan2(dz, dy)
         
-        return [x, y, z, roll, pitch, yaw]
+        return [x, y, z, float(roll), float(pitch), float(yaw)]
 
 def main(args=None):
     """Entry point: parse --config, construct HeadFaceTracker, and spin until interrupted."""

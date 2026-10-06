@@ -80,6 +80,14 @@ class InterfaceMonitor(Adw.Application):
         for topic in joy_topics:
             if topic not in self.topic_data:
                 self._add_topic_monitor(topic)
+            else:
+                # Re-fetch names even for an already-tracked topic: the
+                # publishing node may have restarted (same topic, different
+                # process/config) since names were last fetched, and without
+                # this a rescan would never pick up the change.
+                pubs = self.node.get_publishers_info_by_topic(topic)
+                if pubs:
+                    threading.Thread(target=self._fetch_params, args=(topic, pubs[0].node_name), daemon=True).start()
 
     def _add_topic_monitor(self, topic):
         """Create a card + subscription for a newly discovered Joy topic."""
@@ -119,7 +127,13 @@ class InterfaceMonitor(Adw.Application):
             'button_widgets': [],
             'axis_labels': [],
             'button_labels': [],
-            'initialized': False
+            'initialized': False,
+            # Cached until _init_widgets creates the label widgets to apply them to --
+            # the name-fetch service call usually completes before the first Joy
+            # message (which is what triggers _init_widgets), so without this cache
+            # the fetched names arrive with nowhere to go and are silently dropped.
+            'fetched_axis_names': None,
+            'fetched_button_names': None,
         }
 
         # Find the node publishing this topic
@@ -158,14 +172,24 @@ class InterfaceMonitor(Adw.Application):
             time.sleep(0.1)
 
     def _update_labels(self, topic, axis_names, button_names):
-        """Apply fetched axis/button names to the card's labels, if it still exists."""
+        """Apply fetched axis/button names to the card's labels, caching them if needed.
+
+        Caches the names regardless, since the widgets they apply to may not
+        exist yet (see the 'fetched_axis_names'/'fetched_button_names' comment
+        in _add_topic_monitor) -- _init_widgets applies the cache once it runs.
+        """
         if topic not in self.topic_data: return
         data = self.topic_data[topic]
-        
+        data['fetched_axis_names'] = axis_names
+        data['fetched_button_names'] = button_names
+        self._apply_names(data, axis_names, button_names)
+
+    def _apply_names(self, data, axis_names, button_names):
+        """Write axis/button names into whichever label widgets currently exist."""
         for i, name in enumerate(axis_names):
             if i < len(data['axis_labels']):
                 data['axis_labels'][i].set_text(name)
-        
+
         for i, name in enumerate(button_names):
             if i < len(data['button_labels']):
                 data['button_labels'][i].set_text(name)
@@ -246,8 +270,13 @@ class InterfaceMonitor(Adw.Application):
             lbl.set_halign(Gtk.Align.START)
             btn_box.append(lbl)
             data['button_labels'].append(lbl)
-            
+
             grid.append(btn_box)
+
+        # Apply any names the fetch-params service call already delivered
+        # before these widgets existed.
+        if data['fetched_axis_names'] is not None or data['fetched_button_names'] is not None:
+            self._apply_names(data, data['fetched_axis_names'] or [], data['fetched_button_names'] or [])
 
 def main(args=None):
     """Entry point: spin a plain Node on a thread and run the InterfaceMonitor GTK app."""

@@ -13,6 +13,7 @@ import pytest
 from sensor_msgs.msg import JointState
 
 from control_schemes.stretch_single_switch_control import StretchSingleSwitchControlNode
+from stretch4_kinematics.state import StretchJointVelocities
 
 
 @pytest.fixture
@@ -100,6 +101,89 @@ def test_state_0_still_recenters_gripper(node):
     pos_msg = node.pos_pub.publish.call_args[0][0]
     assert pos_msg.name == ["stretch_gripper"]
     assert list(pos_msg.position) == [0.0]
+
+
+def test_state_3_zeroes_only_lift_near_lower_limit(node):
+    """Lift near its lower limit, moving further into it, gets zeroed --
+
+    arm and base keep whatever the IK solved. Regression test for a bug where
+    the whole exploration direction got vetoed/reverted instead of just lift.
+    """
+    node.pos_pub.publish = MagicMock()
+    node.vel_pub.publish = MagicMock()
+    node.base_pub.publish = MagicMock()
+
+    for _ in range(3):  # Drive to state 3: 0->1->2->3
+        node.handle_joy([], [0])
+        node.handle_joy([], [1])
+    assert node._state == 3
+
+    msg = JointState()
+    msg.name = [
+        "lift_joint", "arm_l1_joint", "arm_l2_joint", "arm_l3_joint", "arm_l4_joint",
+        "wrist_yaw_joint", "wrist_pitch_joint", "wrist_roll_joint",
+    ]
+    lift_lower = node.get_parameter("limit.lift.lower").value
+    msg.position = [lift_lower + 0.01, 0.1, 0.1, 0.1, 0.1, 0.0, 0.0, 0.0]
+    node.joint_states_callback(msg)
+
+    node.kinematics_solver.differential_ik = MagicMock(
+        return_value=StretchJointVelocities(
+            base_x=0.02, base_y=0.0, base_theta=0.0,
+            lift=-0.05, arm=0.03,
+            wrist_yaw=0.0, wrist_pitch=0.0, wrist_roll=0.0,
+        )
+    )
+
+    node.timer_callback()
+
+    vel_msg = node.vel_pub.publish.call_args[0][0]
+    assert vel_msg.velocity[0] == 0.0
+    assert vel_msg.velocity[1] == pytest.approx(0.03)
+    twist = node.base_pub.publish.call_args[0][0]
+    assert twist.linear.x == pytest.approx(0.02)
+
+
+def test_state_4_zeroes_only_arm_near_upper_limit(node):
+    """Arm near its upper limit, moving further into it, gets zeroed --
+
+    lift and base keep whatever the IK solved. Regression test for the
+    forward/backward inconsistency where the whole motion used to stop.
+    """
+    node.pos_pub.publish = MagicMock()
+    node.vel_pub.publish = MagicMock()
+    node.base_pub.publish = MagicMock()
+
+    for _ in range(4):  # Drive to state 4: 0->1->2->3->4
+        node.handle_joy([], [0])
+        node.handle_joy([], [1])
+    assert node._state == 4
+
+    msg = JointState()
+    msg.name = [
+        "lift_joint", "arm_l1_joint", "arm_l2_joint", "arm_l3_joint", "arm_l4_joint",
+        "wrist_yaw_joint", "wrist_pitch_joint", "wrist_roll_joint",
+    ]
+    arm_upper = node.get_parameter("limit.arm.upper").value
+    seg = (arm_upper - 0.01) / 4.0  # near the upper limit, split across 4 segments
+    msg.position = [0.5, seg, seg, seg, seg, 0.0, 0.0, 0.0]
+    node.joint_states_callback(msg)
+
+    node.kinematics_solver.differential_ik = MagicMock(
+        return_value=StretchJointVelocities(
+            base_x=0.02, base_y=0.0, base_theta=0.0,
+            lift=0.04, arm=0.05,
+            wrist_yaw=0.0, wrist_pitch=0.0, wrist_roll=0.0,
+        )
+    )
+
+    node.timer_callback()
+
+    vel_msg = node.vel_pub.publish.call_args[0][0]
+    assert vel_msg.velocity[1] == 0.0
+    assert vel_msg.velocity[0] == pytest.approx(0.04)
+    twist = node.base_pub.publish.call_args[0][0]
+    assert twist.linear.x == pytest.approx(0.02)
 
 
 if __name__ == "__main__":

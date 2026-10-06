@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""Single-hand MediaPipe tracker: publishes one hand's wrist pose as a 6DOF Joy signal."""
+"""Single-hand MediaPipe tracker: publishes one hand's palm pose as a 6DOF Joy signal."""
 import rclpy
-from teleop_interfaces.mediapipe_base import MediaPipeBaseNode
+from teleop_interfaces.mediapipe_base import MediaPipeBaseNode, palm_center, palm_size, palm_angles
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-import numpy as np
 import cv2
 
 class HandTracker(MediaPipeBaseNode):
     """Tracks a single hand (left or right, selectable) via MediaPipe HandLandmarker."""
 
-    def __init__(self, config_path):
+    def __init__(self, config_path, node_name='hand_tracker'):
         """Set up the 21 hand landmark point names and, if model_path is set, the detector."""
         hand_lms = [
             'WRIST', 'THUMB_CMC', 'THUMB_MCP', 'THUMB_IP', 'THUMB_TIP',
@@ -21,7 +20,7 @@ class HandTracker(MediaPipeBaseNode):
             'PINKY_MCP', 'PINKY_PIP', 'PINKY_DIP', 'PINKY_TIP'
         ]
         self._point_names = [name.lower() for name in hand_lms]
-        super().__init__('hand_tracker', config_path)
+        super().__init__(node_name, config_path)
         
         self.declare_parameter('hand_to_track', 'left') # 'left' or 'right'
         
@@ -38,9 +37,11 @@ class HandTracker(MediaPipeBaseNode):
         """Detect hands, select the configured hand_to_track, and derive a 6DOF pose.
 
         Returns:
-            [x, y, z, roll=0, pitch, yaw=0] from the wrist landmark, or None if
-            no matching hand is detected. pitch is the image-plane angle of the
-            wrist-to-middle-finger-MCP vector, not a true 3D pitch.
+            [x, y, z, roll, pitch, yaw], or None if no matching hand is
+            detected. x/y are the palm center (mean of the wrist and the four
+            finger MCPs), z is 1 / palm size (grows as the hand moves away),
+            and roll/pitch/yaw come from the palm plane (see
+            mediapipe_base.palm_angles).
         """
         if not hasattr(self, 'detector'):
             return None
@@ -69,17 +70,13 @@ class HandTracker(MediaPipeBaseNode):
             l_name = self._point_names[j]
             self._landmarks[l_name] = [lm.x, lm.y, lm.z]
 
-        wrist = self._landmarks['wrist']
-        x, y, z = wrist
-        
-        m_mcp = self._landmarks['middle_finger_mcp']
-        dx = m_mcp[0] - wrist[0]
-        dy = m_mcp[1] - wrist[1]
-        pitch = np.arctan2(dy, dx)
-        
-        roll, yaw = 0.0, 0.0
-            
-        return [x, y, z, roll, pitch, yaw]
+        h, w = frame.shape[:2]
+        aspect = h / w
+        x, y, _ = palm_center(self._landmarks)
+        z = 1.0 / max(palm_size(self._landmarks, aspect), 1e-6)
+        roll, pitch, yaw = palm_angles(self._landmarks, aspect)
+
+        return [float(x), float(y), z, roll, pitch, yaw]
 
 def main(args=None):
     """Entry point: parse --config, construct HandTracker, and spin until interrupted."""

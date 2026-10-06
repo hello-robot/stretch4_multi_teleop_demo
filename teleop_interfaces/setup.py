@@ -35,6 +35,7 @@ setup(
             'head_face_tracker = teleop_interfaces.head_face_tracker:main',
             'hands_tracker = teleop_interfaces.hands_tracker:main',
             'hand_tracker = teleop_interfaces.hand_tracker:main',
+            'mediapipe_calibrator = teleop_interfaces.mediapipe_calibrator:main',
             'voice_node = teleop_interfaces.voice_node:main',
             'gui_node = teleop_interfaces.gui_node:main',
             'interface_monitor = teleop_interfaces.interface_monitor:main',

@@ -313,31 +313,23 @@ class StretchSingleSwitchControlNode(ControlSchemeNode):
             vel_msg.velocity[3] = float(self._exploration_direction * max_pitch_vel)
             
         elif self._state == 3:
-            # TRANSLATING: Oscillate forward/backward in local gripper X
-            # Oscillate direction every 3.0 seconds, OR if lift or arm approaches safety limits
+            # TRANSLATING: Oscillate forward/backward in local gripper X every 3.0 seconds.
+            # Lift/arm are independently zeroed below (not the whole motion) if each is
+            # close to its own limit in the direction that would make it worse -- base and
+            # the other joint keep moving normally regardless.
             now = self.get_clock().now()
             elapsed_sec = (now - self._state_start_time).nanoseconds / 1e9
             if elapsed_sec > 3.0:
                 self._exploration_direction *= -1
                 self._state_start_time = now
                 self.get_logger().info(f"Timed oscillation: switching direction to {self._exploration_direction}")
-            elif q_state.lift >= lift_upper - 0.03 or q_state.arm >= arm_upper - 0.03:
-                if self._exploration_direction == 1:
-                    self._exploration_direction = -1
-                    self._state_start_time = now
-                    self.get_logger().info("Limit hit: reversing to backward (-1)")
-            elif q_state.lift <= lift_lower + 0.03 or q_state.arm <= arm_lower + 0.03:
-                if self._exploration_direction == -1:
-                    self._exploration_direction = 1
-                    self._state_start_time = now
-                    self.get_logger().info("Limit hit: reversing to forward (+1)")
-                
+
             v_x = self._exploration_direction * max_linear_vel
             v_desired = np.array([v_x, 0.0, 0.0, 0.0, 0.0, 0.0])
-            
+
             # Solve using library differential_ik (fully redone at each 20Hz timestep)
             v_solved = self.kinematics_solver.differential_ik(q_state, "grasp_center_link", v_desired)
-            
+
             twist.linear.x = float(v_solved.base_x)
             twist.linear.y = float(v_solved.base_y)
             twist.angular.z = float(v_solved.base_theta)
@@ -348,21 +340,24 @@ class StretchSingleSwitchControlNode(ControlSchemeNode):
                 float(v_solved.wrist_pitch),
                 float(v_solved.wrist_roll)
             ]
-            
+
+            if (vel_msg.velocity[0] > 0 and q_state.lift >= lift_upper - 0.03) or \
+               (vel_msg.velocity[0] < 0 and q_state.lift <= lift_lower + 0.03):
+                vel_msg.velocity[0] = 0.0
+            if (vel_msg.velocity[1] > 0 and q_state.arm >= arm_upper - 0.03) or \
+               (vel_msg.velocity[1] < 0 and q_state.arm <= arm_lower + 0.03):
+                vel_msg.velocity[1] = 0.0
+
         elif self._state == 4:
-            # MOVING: Continuous movement in selected direction
+            # MOVING: Continuous movement in selected direction. Lift/arm are
+            # independently zeroed below (not the whole motion) if each is close to
+            # its own limit -- base and the other joint keep moving normally.
             v_x = self._selected_v_x
             self.get_logger().info(f"Selected velocity: {v_x}")
-            
-            # Safe hold: Stop translation if manipulator hits safety limits
-            if (v_x > 0 and (q_state.lift >= lift_upper - 0.02 or q_state.arm >= arm_upper - 0.02)) or \
-               (v_x < 0 and (q_state.lift <= lift_lower + 0.02 or q_state.arm <= arm_lower + 0.02)):
-                v_x = 0.0
-                self.get_logger().warning("At safety limits, setting v to 0.0")
-                
+
             v_desired = np.array([v_x, 0.0, 0.0, 0.0, 0.0, 0.0])
             v_solved = self.kinematics_solver.differential_ik(q_state, "grasp_center_link", v_desired)
-            
+
             twist.linear.x = float(v_solved.base_x)
             twist.linear.y = float(v_solved.base_y)
             twist.angular.z = float(v_solved.base_theta)
@@ -373,6 +368,13 @@ class StretchSingleSwitchControlNode(ControlSchemeNode):
                 float(v_solved.wrist_pitch),
                 float(v_solved.wrist_roll)
             ]
+
+            if (vel_msg.velocity[0] > 0 and q_state.lift >= lift_upper - 0.02) or \
+               (vel_msg.velocity[0] < 0 and q_state.lift <= lift_lower + 0.02):
+                vel_msg.velocity[0] = 0.0
+            if (vel_msg.velocity[1] > 0 and q_state.arm >= arm_upper - 0.02) or \
+               (vel_msg.velocity[1] < 0 and q_state.arm <= arm_lower + 0.02):
+                vel_msg.velocity[1] = 0.0
             
         # Direction-preserving joint velocity scaling for safety
         scale = 1.0

@@ -96,6 +96,98 @@ class CvBridge:
         else:
             raise ValueError(f"Cannot convert encoding {msg.encoding} to bgr8")
 
+
+# --- Pose helpers shared by the trackers ---
+#
+# MediaPipe landmark x is normalized by image width and y by image height, so
+# vectors built from raw landmarks are distorted on non-square frames. The
+# helpers below first rescale y by the aspect ratio (h / w) so x, y, and z
+# (which MediaPipe already scales roughly like x) all share "image widths" as
+# their unit, then measure angles and sizes in that space.
+#
+# Depth: MediaPipe hand z is relative to the wrist (and face z to the head
+# center), so no single landmark's z tracks distance to the camera. The
+# trackers instead use 1 / (apparent size), which grows roughly linearly as the
+# hand/face moves away from the camera.
+
+PALM_POINTS = ['wrist', 'index_finger_mcp', 'middle_finger_mcp', 'ring_finger_mcp', 'pinky_mcp']
+
+
+def aspect_corrected(landmark, aspect):
+    """Return a normalized [x, y, z] landmark rescaled so all axes are in image widths.
+
+    Args:
+        landmark: [x, y, z] as produced by MediaPipe (x, y in [0, 1]).
+        aspect: image height / image width.
+    """
+    return np.array([landmark[0], landmark[1] * aspect, landmark[2]])
+
+
+def palm_center(landmarks, prefix=''):
+    """Mean of the wrist and the four finger MCPs, in raw normalized coordinates."""
+    return np.mean([landmarks[prefix + name] for name in PALM_POINTS], axis=0)
+
+
+def palm_size(landmarks, aspect, prefix=''):
+    """Mean in-plane wrist-to-MCP distance, in image widths (larger = closer)."""
+    wrist = aspect_corrected(landmarks[prefix + 'wrist'], aspect)
+    dists = [np.linalg.norm((aspect_corrected(landmarks[prefix + name], aspect) - wrist)[:2])
+             for name in PALM_POINTS[1:]]
+    return float(np.mean(dists))
+
+
+def palm_angles(landmarks, aspect, prefix=''):
+    """Estimate (roll, pitch, yaw) in radians from the palm plane.
+
+    Uses the same conventions as head_face_tracker, all 0 for an upright hand
+    with the palm facing the camera:
+      roll:  in-plane tilt of the wrist->middle-MCP ("up") vector.
+      pitch: that up vector tipping toward/away from the camera (fingers
+             away from the camera is positive, like the face tracker's
+             head-tilted-back).
+      yaw:   depth difference across the palm (index MCP <-> pinky MCP),
+             hand-right side minus hand-left side, like the face tracker's
+             right-eye minus left-eye. The "hand-right" side is found from the
+             up vector rather than the handedness label, so it works for
+             either hand and stays correct as the hand rolls.
+    """
+    wrist = aspect_corrected(landmarks[prefix + 'wrist'], aspect)
+    index = aspect_corrected(landmarks[prefix + 'index_finger_mcp'], aspect)
+    middle = aspect_corrected(landmarks[prefix + 'middle_finger_mcp'], aspect)
+    pinky = aspect_corrected(landmarks[prefix + 'pinky_mcp'], aspect)
+
+    up = middle - wrist
+    roll = np.arctan2(up[0], -up[1])
+    pitch = np.arctan2(up[2], np.hypot(up[0], up[1]))
+
+    across = pinky - index
+    # In-plane direction pointing to the hand's right (image-right for an upright hand)
+    hand_right = np.array([-up[1], up[0]])
+    if np.dot(across[:2], hand_right) < 0:
+        across = -across
+    yaw = np.arctan2(across[2], np.hypot(across[0], across[1]))
+
+    return float(roll), float(pitch), float(yaw)
+
+
+def normalize_6dof(state, zero, ws_min, ws_max):
+    """Map a raw 6DOF pose into [-1, 1] per axis, asymmetrically around `zero`.
+
+    Values between zero and ws_max map to [0, 1]; values between ws_min and
+    zero map to [-1, 0]. Results are clamped to [-1, 1].
+    """
+    normalized = []
+    for val, z_val, min_val, max_val in zip(state, zero, ws_min, ws_max):
+        if val < z_val:
+            denom = z_val - min_val
+        else:
+            denom = max_val - z_val
+        if abs(denom) < 1e-6:
+            denom = 1e-6
+        normalized.append(max(-1.0, min(1.0, (val - z_val) / denom)))
+    return normalized
+
+
 class MediaPipeBaseNode(InputInterfaceNode):
     """Base class for camera-driven trackers: capture, normalize to 6DOF, publish Joy.
 
@@ -132,13 +224,22 @@ class MediaPipeBaseNode(InputInterfaceNode):
         self.declare_parameter('use_webcam', True)
         self.declare_parameter('webcam_id', 0)
         self.declare_parameter('image_topic', '/image_raw')
-        self.declare_parameter('workspace_zero', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        self.declare_parameter('workspace_center', [0.5, 0.5, 0.0, 0.0, 0.0, 0.0])
+        # Workspace, per axis [x, y, z, roll, pitch, yaw]. x/y are normalized
+        # image coordinates, z is 1 / apparent size (see pose helpers above),
+        # and angles are radians. Z defaults were measured on a 640x480 webcam
+        # (close ~4.5, comfortable ~7, far ~12) - run mediapipe_calibrator to
+        # tune them for a given user/camera.
+        half_pi = float(np.pi / 2)
+        self.declare_parameter('workspace_zero', [0.5, 0.5, 7.0, 0.0, 0.0, 0.0])
         self.declare_parameter('workspace_dims', [1.0, 1.0, 1.0])
-        self.declare_parameter('workspace_min', [0.0, 0.0, -0.5, -1.0, -1.0, -1.0])
-        self.declare_parameter('workspace_max', [1.0, 1.0, 0.5, 1.0, 1.0, 1.0])
+        self.declare_parameter('workspace_min', [0.0, 0.0, 4.5, -half_pi, -half_pi, -half_pi])
+        self.declare_parameter('workspace_max', [1.0, 1.0, 12.0, half_pi, half_pi, half_pi])
         self.declare_parameter('model_path', '') # Required
         self.declare_parameter('visualize', True)
+        # Flip each frame horizontally before tracking, so the image (and x,
+        # roll, yaw) behave like a mirror. This also makes MediaPipe's hand
+        # labels match the user's real hands, since it assumes mirrored input.
+        self.declare_parameter('mirror', True)
         
         # Point names should be set by subclass BEFORE calling super().__init__
         point_names = getattr(self, '_point_names', [])
@@ -156,6 +257,8 @@ class MediaPipeBaseNode(InputInterfaceNode):
         
         # Internal state for landmarks: {name: [x, y, z]}
         self._landmarks = {}
+        # Most recent raw (un-normalized) 6DOF pose, or None if nothing tracked
+        self._last_raw_state = None
         self._last_time = self.get_clock().now()
         self._fps = 0.0
         
@@ -314,58 +417,50 @@ class MediaPipeBaseNode(InputInterfaceNode):
             self._fps = self._fps * 0.9 + (1.0 / dt) * 0.1
         self._last_time = now
 
-    def _handle_frame(self, frame):
-        """Run process_frame, normalize the 6DOF pose + virtual items, and publish Joy.
+    def _get_workspace(self):
+        """Read the workspace parameters and resolve them to 6DOF lists.
 
-        Shows the raw frame (if visualize) when process_frame returns None.
+        Returns:
+            (zero, ws_min, ws_max), each a 6-element list.
         """
-        state_6dof = self.process_frame(frame)
-        if state_6dof is None:
-            if self.get_parameter('visualize').value:
-                cv2.imshow(f"{self.get_name()} Visualization", frame)
-                cv2.waitKey(1)
-            return
-            
-        # Fetch 6DOF parameters
-        zero = self.get_parameter('workspace_zero').value
-        dims = self.get_parameter('workspace_dims').value
-        ws_min = self.get_parameter('workspace_min').value
-        ws_max = self.get_parameter('workspace_max').value
-        
-        # Resolve zero to 6DOF
+        zero = list(self.get_parameter('workspace_zero').value)
+        dims = list(self.get_parameter('workspace_dims').value)
+        ws_min = list(self.get_parameter('workspace_min').value)
+        ws_max = list(self.get_parameter('workspace_max').value)
+
+        # Position-only (3-element) values get default orientation entries
+        half_pi = float(np.pi / 2)
         if len(zero) == 3:
-            zero = list(zero) + [0.0, 0.0, 0.0]
-            
-        # Resolve ws_min/ws_max to 6DOF
+            zero += [0.0, 0.0, 0.0]
         if len(ws_min) == 3:
-            ws_min = list(ws_min) + [-1.0, -1.0, -1.0]
+            ws_min += [-half_pi, -half_pi, -half_pi]
         if len(ws_max) == 3:
-            ws_max = list(ws_max) + [1.0, 1.0, 1.0]
-            
+            ws_max += [half_pi, half_pi, half_pi]
+
         # Backwards compatibility with workspace_dims
         if dims != [1.0, 1.0, 1.0]:
             for i in range(3):
                 ws_min[i] = zero[i] - dims[i] / 2.0
                 ws_max[i] = zero[i] + dims[i] / 2.0
 
-        # Normalize 6DOF asymmetric position & orientation
-        axes_values = []
-        for i in range(6):
-            val = state_6dof[i]
-            z_val = zero[i]
-            min_val = ws_min[i]
-            max_val = ws_max[i]
-            
-            if val < z_val:
-                denom = z_val - min_val
-                if abs(denom) < 1e-6: denom = 1e-6
-                n_val = (val - z_val) / denom
-            else:
-                denom = max_val - z_val
-                if abs(denom) < 1e-6: denom = 1e-6
-                n_val = (val - z_val) / denom
-                
-            axes_values.append(max(-1.0, min(1.0, n_val)))
+        return zero, ws_min, ws_max
+
+    def _handle_frame(self, frame):
+        """Run process_frame, normalize the 6DOF pose + virtual items, and publish Joy.
+
+        Shows the raw frame (if visualize) when process_frame returns None.
+        """
+        if self.get_parameter('mirror').value:
+            frame = cv2.flip(frame, 1)
+        state_6dof = self.process_frame(frame)
+        self._last_raw_state = state_6dof
+        if state_6dof is None:
+            if self.get_parameter('visualize').value:
+                self._show_frame(frame)
+            return
+
+        zero, ws_min, ws_max = self._get_workspace()
+        axes_values = normalize_6dof(state_6dof, zero, ws_min, ws_max)
         button_values = []
         
         # Process virtual items
@@ -427,7 +522,14 @@ class MediaPipeBaseNode(InputInterfaceNode):
         x_max = int(ws_max[0] * w)
         y_max = int(ws_max[1] * h)
         cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), V_BLUE, 2)
-        cv2.putText(frame, "WORKSPACE", (x_min, y_min-10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, V_BLUE, 1)
+        # Label above the box's top-left corner when there's room. Otherwise (e.g.
+        # the default full-frame workspace) put it inside the bottom-right corner,
+        # clear of the 6DOF panel and virtual-item overlay on the left.
+        if y_min >= 20 and x_min >= 0:
+            label_pos = (x_min, y_min - 10)
+        else:
+            label_pos = (min(x_max, w) - 80, min(y_max, h) - 8)
+        cv2.putText(frame, "WORKSPACE", label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.4, V_BLUE, 1)
         
         # 1.5 Draw FPS
         cv2.putText(frame, f"FPS: {self._fps:.1f}", (w - 100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, V_YELLOW, 2)
@@ -440,25 +542,8 @@ class MediaPipeBaseNode(InputInterfaceNode):
         cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
         cv2.rectangle(frame, (10, 10), (10 + panel_w, 10 + panel_h), V_BLUE, 1)
         
-        # Calculate asymmetric 6DOF normalized position & orientation using zero
-        norm_vals = []
-        for i in range(6):
-            val = state[i]
-            z_val = zero[i]
-            min_val = ws_min[i]
-            max_val = ws_max[i]
-            
-            if val < z_val:
-                denom = z_val - min_val
-                if abs(denom) < 1e-6: denom = 1e-6
-                n_val = (val - z_val) / denom
-            else:
-                denom = max_val - z_val
-                if abs(denom) < 1e-6: denom = 1e-6
-                n_val = (val - z_val) / denom
-                
-            norm_vals.append(max(-1.0, min(1.0, n_val)))
-        
+        norm_vals = normalize_6dof(state, zero, ws_min, ws_max)
+
         cv2.putText(frame, "6DOF POSE", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.45, V_YELLOW, 1, cv2.LINE_AA)
         color_lbl = (200, 200, 200)
         cv2.putText(frame, f"X:     {norm_vals[0]:.2f} ({state[0]:.3f})", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color_lbl, 1, cv2.LINE_AA)
@@ -525,8 +610,12 @@ class MediaPipeBaseNode(InputInterfaceNode):
             
             # 6. List data in the overlay
             for i, (text, txt_color) in enumerate(data_lines):
-                cv2.putText(frame, text, (20, h - bar_height + 20 + i*20), 
+                cv2.putText(frame, text, (20, h - bar_height + 20 + i*20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, txt_color, 1)
 
+        self._show_frame(frame)
+
+    def _show_frame(self, frame):
+        """Display a (possibly annotated) frame. Overridden by mediapipe_calibrator."""
         cv2.imshow(f"{self.get_name()} Visualization", frame)
         cv2.waitKey(1)

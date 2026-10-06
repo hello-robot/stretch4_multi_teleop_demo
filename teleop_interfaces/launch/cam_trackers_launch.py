@@ -60,9 +60,10 @@ def generate_launch_description():
                 'visualize': LaunchConfiguration('visualize'),
                 'use_webcam': False,
                 'image_topic': LaunchConfiguration('image_topic'),
-                'workspace_zero': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                'workspace_min': [0.0, 0.0, -0.5, -0.4, -0.3, -0.5],
-                'workspace_max': [1.0, 1.0, 0.5, 0.4, 0.45, 0.5],
+                # z is 1 / apparent size (matches the node defaults); angles are
+                # radians, tuned tighter than the default +/-pi/2 for head motion.
+                'workspace_min': [0.0, 0.0, 4.5, -0.4, -0.3, -0.5],
+                'workspace_max': [1.0, 1.0, 12.0, 0.4, 0.45, 0.5],
             }],
             arguments=['-c', PathJoinSubstitution([pkg_share, 'config', 'head_face_config.yaml'])]
         ),
@@ -77,7 +78,6 @@ def generate_launch_description():
                 'visualize': LaunchConfiguration('visualize'),
                 'use_webcam': False,
                 'image_topic': LaunchConfiguration('image_topic'),
-                'workspace_zero': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             }],
             arguments=['-c', PathJoinSubstitution([pkg_share, 'config', 'hands_config.yaml'])]
         ),
@@ -93,7 +93,6 @@ def generate_launch_description():
                 'hand_to_track': 'right',
                 'use_webcam': False,
                 'image_topic': LaunchConfiguration('image_topic'),
-                'workspace_zero': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             }],
             arguments=['-c', PathJoinSubstitution([pkg_share, 'config', 'hand_config.yaml'])]
         ),
